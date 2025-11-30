@@ -8,13 +8,11 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/float32.hpp>
 
 #include "unitree_api/msg/request.hpp"
 #include "common/ros2_sport_client.h"
-
-#include <geometry_msgs/msg/twist_stamped.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <std_msgs/msg/float32.hpp>
 
 double current_x = 0.0;
 double current_y = 0.0;
@@ -30,9 +28,6 @@ int state = -1;
 std::vector<double> waypoints_x;
 std::vector<double> waypoints_y;
 
-int robot_x = 0;
-int robot_y = 0;
-
 
 
 
@@ -40,6 +35,27 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto nh = rclcpp::Node::make_shared("mover");
+
+    // Declare tunable parameters (can be overridden via ROS params)
+    nh->declare_parameter<double>("lookAheadDis", 1.0);
+    nh->declare_parameter<double>("yawRateGain", 1.5);
+    nh->declare_parameter<double>("maxAccel", 0.5);
+    nh->declare_parameter<double>("max_linear_speed", 0.4);
+    nh->declare_parameter<double>("max_angular_speed", 0.35);
+
+    // Local variables to hold parameter values (defaults mirrored in declare_parameter)
+    double lookAheadDis = 1.0;
+    double yawRateGain = 1.5;
+    double maxAccel = 0.5;
+    double max_linear_speed = 0.4;
+    double max_angular_speed = 0.35;
+
+    // Read params into local variables (overrides defaults above if provided)
+    nh->get_parameter("lookAheadDis", lookAheadDis);
+    nh->get_parameter("yawRateGain", yawRateGain);
+    nh->get_parameter("maxAccel", maxAccel);
+    nh->get_parameter("max_linear_speed", max_linear_speed);
+    nh->get_parameter("max_angular_speed", max_angular_speed);
 
     // Load waypoints from CSV file
     std::ifstream file("/home/unitree/calib_imu/src/mover/src/waypoints.csv");
@@ -129,40 +145,18 @@ int main(int argc, char** argv)
     unitree_api::msg::Request req;
     SportClient sport_req;
 
-    
-    double ang_vel = 0.8;
-    double lin_vel = 0.4;
-    int i =0;
+    int i = 0;
     int pathPointID = 0;
-    double lookAheadDis = 1.0; // meters
-    double yawRateGain = 1.5;  // yaw-rate proportional gain
-    double maxAccel = 0.5;     // m/s^2 for speed ramping
     double vehicleSpeed = 0.0; // current commanded speed (m/s)
     double targetSpeed = 0.0;
     double dx = 0.0;
     double dy = 0.0;
-    double theta = 0.0;
-    double delta_theta = 0.0;
     
-    // PD gains for angular control (tuned to avoid saturation)
-    double Kp_ang = 0.3;  // reduced proportional gain for heading
-    double Kd_ang = 0.5;  // increased damping to reduce overshoot
+    // Derivative tracking for debugging/visualization
     double prev_ang_error = 0.0;
     auto prev_ang_time = std::chrono::system_clock::now();
-    
-    // PD gains for linear control (tuned to avoid saturation)
-    double Kp_lin = 0.25; // reduced proportional gain for distance
-    double Kd_lin = 0.5;  // increased damping to reduce overshoot
     double prev_lin_error = 0.0;
     auto prev_lin_time = std::chrono::system_clock::now();
-    
-    // Speed limits (back to conservative values to avoid overshoot)
-    const double max_linear_speed = 0.4;   // reduced to prevent overshoot
-    const double max_angular_speed = 0.35; // reduced for smoother approach
-    
-    double linear_speed = 0.5;
-    double z_vel = 0;
-    double x_vel = 0;
 
     // Wait for first odometry message
     RCLCPP_INFO(nh->get_logger(), "Waiting for odometry data...");
@@ -211,114 +205,163 @@ int main(int argc, char** argv)
             state = 1;
         }
         if(state == 1){
-        if ( i < waypoints_x.size()){
-            // get localization output
-            // convert orientation to yaw
-            // TODO: fix the double start button?
-            // distance to the current (i) waypoint
+        if (i < waypoints_x.size()){
+            // Check if we've passed the current waypoint (for smooth advancement)
             double dist_i_dx = waypoints_x[i] - current_x;
             double dist_i_dy = waypoints_y[i] - current_y;
             double distance_i = std::sqrt(dist_i_dx * dist_i_dx + dist_i_dy * dist_i_dy);
 
-            // Advance pathPointID until lookahead distance is ahead
-            pathPointID = std::max(pathPointID, i);
-            while (pathPointID < (int)waypoints_x.size() - 1) {
-                double pdx = waypoints_x[pathPointID] - current_x;
-                double pdy = waypoints_y[pathPointID] - current_y;
-                double pdist = std::sqrt(pdx * pdx + pdy * pdy);
-                if (pdist < lookAheadDis) pathPointID++; else break;
+            // Advance waypoint index if we're close enough (smooth transition, don't stop)
+            if (distance_i < 0.3 && i < (int)waypoints_x.size() - 1) {
+                i++;
             }
 
-            // target lookahead point
+            // Find lookahead point: farthest waypoint within lookahead distance
+            // Start from current waypoint index and search forward
+            pathPointID = std::max(pathPointID, i);
+            int bestLookaheadID = pathPointID;
+            
+            // Find the farthest waypoint that is still within lookahead distance
+            for (int j = pathPointID; j < (int)waypoints_x.size(); j++) {
+                double pdx = waypoints_x[j] - current_x;
+                double pdy = waypoints_y[j] - current_y;
+                double pdist = std::sqrt(pdx * pdx + pdy * pdy);
+                
+                if (pdist <= lookAheadDis) {
+                    bestLookaheadID = j;  // This point is within lookahead distance
+                } else {
+                    break;  // Beyond lookahead distance, stop searching
+                }
+            }
+            pathPointID = bestLookaheadID;
+
+            // Ensure we don't go beyond the last waypoint
+            if (pathPointID >= (int)waypoints_x.size()) {
+                pathPointID = waypoints_x.size() - 1;
+            }
+
+            // Calculate direction to lookahead point
             double tx = waypoints_x[pathPointID];
             double ty = waypoints_y[pathPointID];
             dx = tx - current_x;
             dy = ty - current_y;
-            double pathDir = atan2(dy, dx);
+            double lookahead_dist = std::sqrt(dx * dx + dy * dy);
+            double pathDir = std::atan2(dy, dx);
 
-            // angular error (dirDiff) between path direction and vehicle yaw
+            // Angular error between path direction and vehicle yaw
             double dirDiff = pathDir - current_yaw;
+            // Normalize to [-pi, pi]
             while (dirDiff > M_PI) dirDiff -= 2.0 * M_PI;
             while (dirDiff < -M_PI) dirDiff += 2.0 * M_PI;
 
-            // Continuous yaw-rate controller
-            double vehicleYawRate = -yawRateGain * dirDiff;
+            // Angular velocity controller: turn toward the path
+            double vehicleYawRate = yawRateGain * dirDiff;
+            // Limit angular velocity
             if (vehicleYawRate > max_angular_speed) vehicleYawRate = max_angular_speed;
             if (vehicleYawRate < -max_angular_speed) vehicleYawRate = -max_angular_speed;
 
-            // determine target forward speed based on distance to current waypoint (i)
-            if (distance_i < 0.2) {
-                // reached waypoint -> stop and advance
-                i++;
-                vehicleSpeed = 0.0;
-                targetSpeed = 0.0;
-
-                // Publish zero derivative when stopped / waypoint reached
-                std_msgs::msg::Float32 stop_deriv_msg;
-                stop_deriv_msg.data = 0.0f;
-                pubDerivativeAng->publish(stop_deriv_msg);
-                pubDerivativeLin->publish(stop_deriv_msg);
-
-                // Reset prev states
-                prev_ang_error = 0.0;
-                prev_ang_time = std::chrono::system_clock::now();
-                prev_lin_error = 0.0;
-                prev_lin_time = std::chrono::system_clock::now();
-            } else {
-                if (distance_i < 1.0) {
-                    targetSpeed = max_linear_speed * (distance_i / 1.0); // slow down near target
+            // Determine target forward speed based on:
+            // 1. Distance to lookahead point (slow down when close)
+            // 2. Angular error (slow down when turning sharply)
+            double speed_reduction_factor = 1.0;
+            
+            // Reduce speed when close to lookahead point
+            if (lookahead_dist < 1.0) {
+                speed_reduction_factor = std::max(0.3, lookahead_dist / 1.0);
+            }
+            
+            // Reduce speed when turning sharply (for stability)
+            double abs_ang_error = std::abs(dirDiff);
+            if (abs_ang_error > M_PI / 6.0) {  // More than 30 degrees
+                speed_reduction_factor *= std::max(0.5, 1.0 - (abs_ang_error - M_PI/6.0) / (M_PI/3.0));
+            }
+            
+            // Check if we're at the final waypoint
+            bool is_final_waypoint = (i >= (int)waypoints_x.size() - 1);
+            double final_waypoint_dist = 0.0;
+            if (is_final_waypoint) {
+                double final_dx = waypoints_x[waypoints_x.size() - 1] - current_x;
+                double final_dy = waypoints_y[waypoints_y.size() - 1] - current_y;
+                final_waypoint_dist = std::sqrt(final_dx * final_dx + final_dy * final_dy);
+                
+                // Stop when very close to final waypoint
+                if (final_waypoint_dist < 0.15) {
+                    targetSpeed = 0.0;
+                } else if (final_waypoint_dist < 0.5) {
+                    targetSpeed = max_linear_speed * (final_waypoint_dist / 0.5) * speed_reduction_factor;
                 } else {
-                    targetSpeed = max_linear_speed;
+                    targetSpeed = max_linear_speed * speed_reduction_factor;
                 }
-
-                // ramp vehicleSpeed toward targetSpeed
-                double dt = 1.0 / 100.0; // loop dt (rate 100)
-                double maxDelta = maxAccel * dt;
-                if (vehicleSpeed < targetSpeed) vehicleSpeed = std::min(targetSpeed, vehicleSpeed + maxDelta);
-                else if (vehicleSpeed > targetSpeed) vehicleSpeed = std::max(targetSpeed, vehicleSpeed - maxDelta);
-
-                // compute commanded velocities in vehicle frame for lookahead direction
-                cmd_vel.twist.linear.x = cos(dirDiff) * vehicleSpeed;
-                cmd_vel.twist.linear.y = -sin(dirDiff) * vehicleSpeed;
-                cmd_vel.twist.angular.z = vehicleYawRate;
-
-                // publish derivatives: angular derivative = d(dirDiff)/dt, linear derivative = d(distance)/dt
-                auto now_der = std::chrono::system_clock::now();
-                double dt_ang = std::chrono::duration_cast<std::chrono::duration<double>>(now_der - prev_ang_time).count();
-                if (dt_ang <= 1e-6) dt_ang = dt;
-                double ang_derivative = (dirDiff - prev_ang_error) / dt_ang;
-                const double max_ang_derivative = 3.0;
-                if (ang_derivative > max_ang_derivative) ang_derivative = max_ang_derivative;
-                if (ang_derivative < -max_ang_derivative) ang_derivative = -max_ang_derivative;
-                std_msgs::msg::Float32 ang_msg; ang_msg.data = static_cast<float>(ang_derivative); pubDerivativeAng->publish(ang_msg);
-
-                double lin_derivative = (distance_i - prev_lin_error) / dt_ang;
-                const double max_lin_derivative = 2.0;
-                if (lin_derivative > max_lin_derivative) lin_derivative = max_lin_derivative;
-                if (lin_derivative < -max_lin_derivative) lin_derivative = -max_lin_derivative;
-                std_msgs::msg::Float32 lin_msg; lin_msg.data = static_cast<float>(lin_derivative); pubDerivativeLin->publish(lin_msg);
-
-                prev_ang_error = dirDiff;
-                prev_ang_time = now_der;
-                prev_lin_error = distance_i;
-                prev_lin_time = now_der;
+            } else {
+                targetSpeed = max_linear_speed * speed_reduction_factor;
             }
 
-            pubSpeed->publish(cmd_vel);
+            // Ramp vehicleSpeed toward targetSpeed with acceleration limit
+            double dt = 1.0 / 100.0; // loop dt (rate 100 Hz)
+            double maxDelta = maxAccel * dt;
+            if (vehicleSpeed < targetSpeed) {
+                vehicleSpeed = std::min(targetSpeed, vehicleSpeed + maxDelta);
+            } else if (vehicleSpeed > targetSpeed) {
+                vehicleSpeed = std::max(targetSpeed, vehicleSpeed - maxDelta);
+            }
 
+            // Forward + Angular control: move forward, turn toward path
+            cmd_vel.twist.linear.x = vehicleSpeed;  // Forward velocity in vehicle frame
+            cmd_vel.twist.linear.y = 0.0;           // No lateral movement
+            cmd_vel.twist.angular.z = vehicleYawRate; // Turn toward path
+
+            // Publish derivatives for debugging/visualization
+            auto now_der = std::chrono::system_clock::now();
+            double dt_ang = std::chrono::duration_cast<std::chrono::duration<double>>(now_der - prev_ang_time).count();
+            if (dt_ang <= 1e-6) dt_ang = dt;
+            
+            double ang_derivative = (dirDiff - prev_ang_error) / dt_ang;
+            const double max_ang_derivative = 3.0;
+            if (ang_derivative > max_ang_derivative) ang_derivative = max_ang_derivative;
+            if (ang_derivative < -max_ang_derivative) ang_derivative = -max_ang_derivative;
+            std_msgs::msg::Float32 ang_msg;
+            ang_msg.data = static_cast<float>(ang_derivative);
+            pubDerivativeAng->publish(ang_msg);
+
+            // Linear derivative based on distance to lookahead point
+            double lin_derivative = (lookahead_dist - prev_lin_error) / dt_ang;
+            const double max_lin_derivative = 2.0;
+            if (lin_derivative > max_lin_derivative) lin_derivative = max_lin_derivative;
+            if (lin_derivative < -max_lin_derivative) lin_derivative = -max_lin_derivative;
+            std_msgs::msg::Float32 lin_msg;
+            lin_msg.data = static_cast<float>(lin_derivative);
+            pubDerivativeLin->publish(lin_msg);
+
+            prev_ang_error = dirDiff;
+            prev_ang_time = now_der;
+            prev_lin_error = lookahead_dist;
+            prev_lin_time = now_der;
+
+            pubSpeed->publish(cmd_vel);
             sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
             pubGo2Request->publish(req);
 
             if(seconds % 1 == 0){
                 std::cout << "=== Status Update ===" << std::endl;
                 std::cout << "Localization rate: " << odom_rate << " Hz (received " << odom_count << " messages)" << std::endl;
-                std::cout << "Waypoint " << i << ": target=(" << waypoints_x[i] << ", " << waypoints_y[i] 
-                        << "), current=(" << current_x << ", " << current_y << "), yaw=" << current_yaw << "\n";
-                // std::cout << "dx: " << dx << ", dy: " << dy << ", delta_theta: " << delta_theta << "\n";
-                // std::cout << "cmd_vel - linear.x: " << cmd_vel.twist.linear.x << ", linear.y: " << cmd_vel.twist.linear.y << ", angular.z: " << cmd_vel.twist.angular.z << "\n";
+                std::cout << "Current waypoint index: " << i << " / " << waypoints_x.size() << std::endl;
+                std::cout << "Lookahead point index: " << pathPointID << std::endl;
+                std::cout << "Current pose: (" << current_x << ", " << current_y << "), yaw=" << current_yaw << std::endl;
+                std::cout << "Target waypoint: (" << waypoints_x[i] << ", " << waypoints_y[i] << ")" << std::endl;
+                std::cout << "Lookahead point: (" << tx << ", " << ty << "), distance=" << lookahead_dist << std::endl;
+                std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
+                std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
             }
         } else {
-            std::cout << "All waypoints reached!" << std::endl;
+            // All waypoints reached - stop the robot
+            cmd_vel.twist.linear.x = 0.0;
+            cmd_vel.twist.linear.y = 0.0;
+            cmd_vel.twist.angular.z = 0.0;
+            pubSpeed->publish(cmd_vel);
+            sport_req.Move(req, 0, 0, 0);
+            pubGo2Request->publish(req);
+            
+            std::cout << "All waypoints reached! Stopping robot." << std::endl;
             break;
         }
     }
