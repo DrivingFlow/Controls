@@ -37,22 +37,31 @@ int main(int argc, char** argv)
     auto nh = rclcpp::Node::make_shared("mover");
 
     // Declare tunable parameters (can be overridden via ROS params)
-    nh->declare_parameter<double>("lookAheadDis", 1.0);
-    nh->declare_parameter<double>("yawRateGain", 1.5);
+    nh->declare_parameter<double>("lookAheadDis", 1.2);  // Reduced for tighter control
+    nh->declare_parameter<double>("yawRateGain", 0.6);   // Further reduced to prevent saturation
+    nh->declare_parameter<double>("yawDerivativeGain", 0.4);  // Increased for more damping
+    nh->declare_parameter<double>("yawErrorDeadband", 0.05);  // Ignore small errors (rad)
+    nh->declare_parameter<double>("maxAngErrorForForward", 0.785);  // Stop forward motion if error > 45 deg (rad)
     nh->declare_parameter<double>("maxAccel", 0.5);
     nh->declare_parameter<double>("max_linear_speed", 0.4);
-    nh->declare_parameter<double>("max_angular_speed", 0.35);
+    nh->declare_parameter<double>("max_angular_speed", 0.25);  // Reduced from 0.35 to prevent saturation
 
     // Local variables to hold parameter values (defaults mirrored in declare_parameter)
-    double lookAheadDis = 1.0;
-    double yawRateGain = 1.5;
+    double lookAheadDis = 1.2;
+    double yawRateGain = 0.6;
+    double yawDerivativeGain = 0.4;
+    double yawErrorDeadband = 0.05;
+    double maxAngErrorForForward = 0.785;  // ~45 degrees
     double maxAccel = 0.5;
     double max_linear_speed = 0.4;
-    double max_angular_speed = 0.35;
+    double max_angular_speed = 0.25;
 
     // Read params into local variables (overrides defaults above if provided)
     nh->get_parameter("lookAheadDis", lookAheadDis);
     nh->get_parameter("yawRateGain", yawRateGain);
+    nh->get_parameter("yawDerivativeGain", yawDerivativeGain);
+    nh->get_parameter("yawErrorDeadband", yawErrorDeadband);
+    nh->get_parameter("maxAngErrorForForward", maxAngErrorForForward);
     nh->get_parameter("maxAccel", maxAccel);
     nh->get_parameter("max_linear_speed", max_linear_speed);
     nh->get_parameter("max_angular_speed", max_angular_speed);
@@ -153,7 +162,8 @@ int main(int argc, char** argv)
     double dy = 0.0;
     
     // Derivative tracking for debugging/visualization
-    double prev_ang_error = 0.0;
+    double prev_ang_error = 0.0;  // Stores filtered error for PD controller
+    double prev_ang_error_raw = 0.0;  // Stores raw error for visualization
     auto prev_ang_time = std::chrono::system_clock::now();
     double prev_lin_error = 0.0;
     auto prev_lin_time = std::chrono::system_clock::now();
@@ -181,6 +191,7 @@ int main(int argc, char** argv)
             while (init_delta < -M_PI) init_delta += 2.0 * M_PI;
             prev_lin_error = init_distance;
             prev_ang_error = init_delta;
+            prev_ang_error_raw = init_delta;
         }
     }
 
@@ -206,19 +217,23 @@ int main(int argc, char** argv)
         }
         if(state == 1){
         if (i < waypoints_x.size()){
-            // Check if we've passed the current waypoint (for smooth advancement)
-            double dist_i_dx = waypoints_x[i] - current_x;
-            double dist_i_dy = waypoints_y[i] - current_y;
-            double distance_i = std::sqrt(dist_i_dx * dist_i_dx + dist_i_dy * dist_i_dy);
-
-            // Advance waypoint index if we're close enough (smooth transition, don't stop)
-            if (distance_i < 0.3 && i < (int)waypoints_x.size() - 1) {
-                i++;
-            }
-
             // Find lookahead point: farthest waypoint within lookahead distance
-            // Start from current waypoint index and search forward
-            pathPointID = std::max(pathPointID, i);
+            // CRITICAL: Don't advance lookahead if robot is far from current waypoint
+            // This prevents aiming at points behind/beside the robot during turns
+            double dist_to_current_wp_dx = waypoints_x[i] - current_x;
+            double dist_to_current_wp_dy = waypoints_y[i] - current_y;
+            double dist_to_current_wp = std::sqrt(dist_to_current_wp_dx * dist_to_current_wp_dx + 
+                                                   dist_to_current_wp_dy * dist_to_current_wp_dy);
+            
+            // Only advance lookahead if we're reasonably close to current waypoint
+            // This prevents lookahead from jumping ahead during wide turns
+            if (dist_to_current_wp < lookAheadDis * 1.5) {
+                pathPointID = std::max(pathPointID, i);
+            } else {
+                // If far from current waypoint, don't advance lookahead beyond current waypoint
+                pathPointID = i;
+            }
+            
             int bestLookaheadID = pathPointID;
             
             // Find the farthest waypoint that is still within lookahead distance
@@ -234,6 +249,54 @@ int main(int argc, char** argv)
                 }
             }
             pathPointID = bestLookaheadID;
+
+            // Advance waypoint index `i` based on multiple criteria:
+            // 1. Close enough to current waypoint (proximity-based)
+            // 2. Lookahead point is significantly ahead (we've likely passed the waypoint)
+            double dist_i_dx = waypoints_x[i] - current_x;
+            double dist_i_dy = waypoints_y[i] - current_y;
+            double distance_i = std::sqrt(dist_i_dx * dist_i_dx + dist_i_dy * dist_i_dy);
+
+            bool should_advance = false;
+            
+            // Criterion 1: Close enough to current waypoint
+            if (distance_i < 0.3 && i < (int)waypoints_x.size() - 1) {
+                should_advance = true;
+            }
+            
+            // Criterion 2: Lookahead point is at least 2 waypoints ahead (we've passed waypoint i)
+            // This handles cases where oscillation prevents getting close to waypoint i
+            if (!should_advance && pathPointID > i + 1 && i < (int)waypoints_x.size() - 1) {
+                should_advance = true;
+            }
+            
+            // Criterion 3: We're past waypoint i (check if we've crossed a line perpendicular to path)
+            // This checks if the robot has moved past the waypoint along the path direction
+            if (!should_advance && i < (int)waypoints_x.size() - 1) {
+                // Vector from waypoint i to waypoint i+1 (path direction)
+                double path_dx = waypoints_x[i+1] - waypoints_x[i];
+                double path_dy = waypoints_y[i+1] - waypoints_y[i];
+                double path_len = std::sqrt(path_dx * path_dx + path_dy * path_dy);
+                
+                if (path_len > 0.01) {  // Avoid division by zero
+                    // Vector from waypoint i to robot
+                    double robot_dx = current_x - waypoints_x[i];
+                    double robot_dy = current_y - waypoints_y[i];
+                    
+                    // Project robot position onto path direction
+                    double projection = (robot_dx * path_dx + robot_dy * path_dy) / path_len;
+                    
+                    // If projection is past waypoint i+1, we've passed waypoint i
+                    if (projection > path_len * 0.8) {  // 80% past waypoint i toward i+1
+                        should_advance = true;
+                    }
+                }
+            }
+            
+            if (should_advance) {
+                i++;
+                RCLCPP_INFO(nh->get_logger(), "Advanced waypoint index to %d", i);
+            }
 
             // Ensure we don't go beyond the last waypoint
             if (pathPointID >= (int)waypoints_x.size()) {
@@ -254,26 +317,76 @@ int main(int argc, char** argv)
             while (dirDiff > M_PI) dirDiff -= 2.0 * M_PI;
             while (dirDiff < -M_PI) dirDiff += 2.0 * M_PI;
 
-            // Angular velocity controller: turn toward the path
-            double vehicleYawRate = yawRateGain * dirDiff;
+            // Angular velocity controller: PD controller (Proportional + Derivative)
+            // Apply deadband to small errors to reduce jitter
+            double dirDiffFiltered = dirDiff;
+            if (std::abs(dirDiff) < yawErrorDeadband) {
+                dirDiffFiltered = 0.0;
+            }
+            
+            // Calculate derivative term (rate of change of error)
+            auto now_ang = std::chrono::system_clock::now();
+            double dt_ang = std::chrono::duration_cast<std::chrono::duration<double>>(now_ang - prev_ang_time).count();
+            if (dt_ang <= 1e-6) dt_ang = 1.0 / 100.0;  // fallback to loop dt
+            
+            double error_derivative = (dirDiffFiltered - prev_ang_error) / dt_ang;
+            
+            // PD controller: P term + D term (derivative provides damping)
+            double vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative;
+            
+            // Adaptive angular speed limit: reduce max speed when error is large to prevent saturation
+            // This prevents constant saturation at ±0.35 rad/s
+            double adaptive_max_angular = max_angular_speed;
+            double abs_error = std::abs(dirDiff);
+            if (abs_error > M_PI / 3.0) {  // Error > 60 degrees
+                // Reduce max angular speed when error is very large
+                adaptive_max_angular = max_angular_speed * 0.7;
+            } else if (abs_error > M_PI / 6.0) {  // Error > 30 degrees
+                adaptive_max_angular = max_angular_speed * 0.85;
+            }
+            
             // Limit angular velocity
-            if (vehicleYawRate > max_angular_speed) vehicleYawRate = max_angular_speed;
-            if (vehicleYawRate < -max_angular_speed) vehicleYawRate = -max_angular_speed;
+            if (vehicleYawRate > adaptive_max_angular) vehicleYawRate = adaptive_max_angular;
+            if (vehicleYawRate < -adaptive_max_angular) vehicleYawRate = -adaptive_max_angular;
 
             // Determine target forward speed based on:
-            // 1. Distance to lookahead point (slow down when close)
-            // 2. Angular error (slow down when turning sharply)
+            // 1. Angular error (CRITICAL: stop or nearly stop when error is large)
+            // 2. Distance to lookahead point (slow down when close)
+            // 3. Angular velocity magnitude (prevent spinning while moving)
             double speed_reduction_factor = 1.0;
+            
+            // CRITICAL FIX: Stop forward motion when angular error is too large
+            // This prevents wide arcs and dangerous overshoot
+            double abs_ang_error = std::abs(dirDiff);
+            if (abs_ang_error > maxAngErrorForForward) {
+                // Error > threshold (default 45 degrees): STOP forward motion, turn in place
+                speed_reduction_factor = 0.0;
+            } else if (abs_ang_error > M_PI / 3.0) {  // Error > 60 degrees (but less than maxAngErrorForForward)
+                // Very aggressive speed reduction: scale from 0.05 at 60deg to 0.0 at maxAngErrorForForward
+                speed_reduction_factor = 0.05 * (1.0 - (abs_ang_error - M_PI/3.0) / (maxAngErrorForForward - M_PI/3.0));
+            } else if (abs_ang_error > M_PI / 4.0) {  // Error > 45 degrees
+                // Aggressive speed reduction: scale from 0.15 at 45deg to 0.05 at 60deg
+                speed_reduction_factor = 0.05 + 0.1 * (1.0 - (abs_ang_error - M_PI/4.0) / (M_PI/3.0 - M_PI/4.0));
+            } else if (abs_ang_error > M_PI / 6.0) {  // Error > 30 degrees
+                // Moderate speed reduction: scale from 0.4 at 30deg to 0.15 at 45deg
+                speed_reduction_factor = 0.15 + 0.25 * (1.0 - (abs_ang_error - M_PI/6.0) / (M_PI/4.0 - M_PI/6.0));
+            } else if (abs_ang_error > M_PI / 12.0) {  // Error > 15 degrees
+                // Light speed reduction: scale from 0.7 at 15deg to 0.4 at 30deg
+                speed_reduction_factor = 0.4 + 0.3 * (1.0 - (abs_ang_error - M_PI/12.0) / (M_PI/6.0 - M_PI/12.0));
+            }
             
             // Reduce speed when close to lookahead point
             if (lookahead_dist < 1.0) {
-                speed_reduction_factor = std::max(0.3, lookahead_dist / 1.0);
+                double proximity_factor = std::max(0.3, lookahead_dist / 1.0);
+                speed_reduction_factor *= proximity_factor;
             }
             
-            // Reduce speed when turning sharply (for stability)
-            double abs_ang_error = std::abs(dirDiff);
-            if (abs_ang_error > M_PI / 6.0) {  // More than 30 degrees
-                speed_reduction_factor *= std::max(0.5, 1.0 - (abs_ang_error - M_PI/6.0) / (M_PI/3.0));
+            // Also reduce speed based on angular velocity magnitude (prevent spinning while moving)
+            double abs_yaw_rate = std::abs(vehicleYawRate);
+            if (abs_yaw_rate > 0.05) {  // If turning faster than 0.05 rad/s (lowered threshold)
+                // More aggressive: reduce speed significantly when turning
+                double yaw_rate_factor = std::max(0.3, 1.0 - (abs_yaw_rate / adaptive_max_angular) * 0.7);
+                speed_reduction_factor *= yaw_rate_factor;
             }
             
             // Check if we're at the final waypoint
@@ -311,11 +424,12 @@ int main(int argc, char** argv)
             cmd_vel.twist.angular.z = vehicleYawRate; // Turn toward path
 
             // Publish derivatives for debugging/visualization
-            auto now_der = std::chrono::system_clock::now();
-            double dt_ang = std::chrono::duration_cast<std::chrono::duration<double>>(now_der - prev_ang_time).count();
-            if (dt_ang <= 1e-6) dt_ang = dt;
+            // Use the same timing as PD controller for consistency
+            double dt_der = dt_ang;  // Use dt_ang calculated above for PD controller
+            if (dt_der <= 1e-6) dt_der = dt;
             
-            double ang_derivative = (dirDiff - prev_ang_error) / dt_ang;
+            // Use raw (unfiltered) dirDiff for visualization (to see actual error rate)
+            double ang_derivative = (dirDiff - prev_ang_error_raw) / dt_der;
             const double max_ang_derivative = 3.0;
             if (ang_derivative > max_ang_derivative) ang_derivative = max_ang_derivative;
             if (ang_derivative < -max_ang_derivative) ang_derivative = -max_ang_derivative;
@@ -324,7 +438,9 @@ int main(int argc, char** argv)
             pubDerivativeAng->publish(ang_msg);
 
             // Linear derivative based on distance to lookahead point
-            double lin_derivative = (lookahead_dist - prev_lin_error) / dt_ang;
+            double dt_lin = std::chrono::duration_cast<std::chrono::duration<double>>(now_ang - prev_lin_time).count();
+            if (dt_lin <= 1e-6) dt_lin = dt;
+            double lin_derivative = (lookahead_dist - prev_lin_error) / dt_lin;
             const double max_lin_derivative = 2.0;
             if (lin_derivative > max_lin_derivative) lin_derivative = max_lin_derivative;
             if (lin_derivative < -max_lin_derivative) lin_derivative = -max_lin_derivative;
@@ -332,10 +448,11 @@ int main(int argc, char** argv)
             lin_msg.data = static_cast<float>(lin_derivative);
             pubDerivativeLin->publish(lin_msg);
 
-            prev_ang_error = dirDiff;
-            prev_ang_time = now_der;
+            prev_ang_error = dirDiffFiltered;  // For PD controller
+            prev_ang_error_raw = dirDiff;  // For visualization
+            prev_ang_time = now_ang;
             prev_lin_error = lookahead_dist;
-            prev_lin_time = now_der;
+            prev_lin_time = now_ang;
 
             pubSpeed->publish(cmd_vel);
             sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
