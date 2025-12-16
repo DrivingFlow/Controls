@@ -40,6 +40,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<double>("lookAheadDis", 1.2);  // Reduced for tighter control
     nh->declare_parameter<double>("yawRateGain", 0.6);   // Further reduced to prevent saturation
     nh->declare_parameter<double>("yawDerivativeGain", 0.4);  // Increased for more damping
+    nh->declare_parameter<double>("lateralErrorGain", 0.8);  // New: gain for lateral error correction
     nh->declare_parameter<double>("yawErrorDeadband", 0.05);  // Ignore small errors (rad)
     nh->declare_parameter<double>("maxAngErrorForForward", 0.785);  // Stop forward motion if error > 45 deg (rad)
     nh->declare_parameter<double>("maxAccel", 0.5);
@@ -50,6 +51,7 @@ int main(int argc, char** argv)
     double lookAheadDis = 1.2;
     double yawRateGain = 0.6;
     double yawDerivativeGain = 0.4;
+    double lateralErrorGain = 0.8;
     double yawErrorDeadband = 0.05;
     double maxAngErrorForForward = 0.785;  // ~45 degrees
     double maxAccel = 0.5;
@@ -60,6 +62,7 @@ int main(int argc, char** argv)
     nh->get_parameter("lookAheadDis", lookAheadDis);
     nh->get_parameter("yawRateGain", yawRateGain);
     nh->get_parameter("yawDerivativeGain", yawDerivativeGain);
+    nh->get_parameter("lateralErrorGain", lateralErrorGain);
     nh->get_parameter("yawErrorDeadband", yawErrorDeadband);
     nh->get_parameter("maxAngErrorForForward", maxAngErrorForForward);
     nh->get_parameter("maxAccel", maxAccel);
@@ -259,8 +262,11 @@ int main(int argc, char** argv)
 
             bool should_advance = false;
             
-            // Criterion 1: Close enough to current waypoint
-            if (distance_i < 0.3 && i < (int)waypoints_x.size() - 1) {
+            // Criterion 1: Close enough to current waypoint (check both dx and dy separately)
+            // This prevents advancing when robot is far laterally even if Euclidean distance is small
+            double abs_dx = std::abs(dist_i_dx);
+            double abs_dy = std::abs(dist_i_dy);
+            if (abs_dx < 0.15 && abs_dy < 0.15 && i < (int)waypoints_x.size() - 1) {
                 should_advance = true;
             }
             
@@ -311,13 +317,55 @@ int main(int argc, char** argv)
             double lookahead_dist = std::sqrt(dx * dx + dy * dy);
             double pathDir = std::atan2(dy, dx);
 
+            // Calculate lateral (cross-track) error to the current path segment
+            // This is critical for converging onto the path instead of tracking parallel to it
+            double lateral_error = 0.0;
+            if (i < (int)waypoints_x.size() - 1) {
+                // Vector from waypoint i to waypoint i+1 (path segment)
+                double seg_dx = waypoints_x[i+1] - waypoints_x[i];
+                double seg_dy = waypoints_y[i+1] - waypoints_y[i];
+                double seg_len = std::sqrt(seg_dx * seg_dx + seg_dy * seg_dy);
+                
+                if (seg_len > 0.01) {  // Avoid division by zero
+                    // Vector from waypoint i to robot
+                    double robot_dx = current_x - waypoints_x[i];
+                    double robot_dy = current_y - waypoints_y[i];
+                    
+                    // Project robot position onto path segment
+                    double projection = (robot_dx * seg_dx + robot_dy * seg_dy) / (seg_len * seg_len);
+                    projection = std::max(0.0, std::min(1.0, projection));  // Clamp to [0, 1]
+                    
+                    // Closest point on path segment
+                    double closest_x = waypoints_x[i] + projection * seg_dx;
+                    double closest_y = waypoints_y[i] + projection * seg_dy;
+                    
+                    // Vector from closest point to robot (lateral error vector)
+                    double lateral_dx = current_x - closest_x;
+                    double lateral_dy = current_y - closest_y;
+                    
+                    // Calculate signed lateral error (positive = left of path, negative = right)
+                    // Use cross product to determine sign: seg × robot_vector
+                    double cross_product = seg_dx * lateral_dy - seg_dy * lateral_dx;
+                    lateral_error = std::sqrt(lateral_dx * lateral_dx + lateral_dy * lateral_dy);
+                    if (cross_product < 0) {
+                        lateral_error = -lateral_error;  // Robot is to the right of path
+                    }
+                }
+            } else {
+                // At final waypoint, use distance to final waypoint as lateral error
+                double final_dx = waypoints_x[i] - current_x;
+                double final_dy = waypoints_y[i] - current_y;
+                lateral_error = std::sqrt(final_dx * final_dx + final_dy * final_dy);
+                // Could add sign based on robot orientation, but for final waypoint it's less critical
+            }
+
             // Angular error between path direction and vehicle yaw
             double dirDiff = pathDir - current_yaw;
             // Normalize to [-pi, pi]
             while (dirDiff > M_PI) dirDiff -= 2.0 * M_PI;
             while (dirDiff < -M_PI) dirDiff += 2.0 * M_PI;
 
-            // Angular velocity controller: PD controller (Proportional + Derivative)
+            // Angular velocity controller: PD controller (Proportional + Derivative) + Lateral Error Correction
             // Apply deadband to small errors to reduce jitter
             double dirDiffFiltered = dirDiff;
             if (std::abs(dirDiff) < yawErrorDeadband) {
@@ -331,8 +379,15 @@ int main(int argc, char** argv)
             
             double error_derivative = (dirDiffFiltered - prev_ang_error) / dt_ang;
             
-            // PD controller: P term + D term (derivative provides damping)
-            double vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative;
+            // Lateral error correction: steer toward path when there's lateral offset
+            // The correction is proportional to lateral error and inversely proportional to lookahead distance
+            // This creates a "pull" toward the path
+            double lateral_correction = lateralErrorGain * lateral_error / std::max(lookahead_dist, 0.5);
+            // Limit lateral correction to prevent instability
+            lateral_correction = std::max(-0.3, std::min(0.3, lateral_correction));
+            
+            // PD controller: P term + D term (derivative provides damping) + Lateral error correction
+            double vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative + lateral_correction;
             
             // Adaptive angular speed limit: reduce max speed when error is large to prevent saturation
             // This prevents constant saturation at ±0.35 rad/s
@@ -392,13 +447,21 @@ int main(int argc, char** argv)
             // Check if we're at the final waypoint
             bool is_final_waypoint = (i >= (int)waypoints_x.size() - 1);
             double final_waypoint_dist = 0.0;
+            bool should_stop_completely = false;
+            
             if (is_final_waypoint) {
                 double final_dx = waypoints_x[waypoints_x.size() - 1] - current_x;
                 double final_dy = waypoints_y[waypoints_y.size() - 1] - current_y;
                 final_waypoint_dist = std::sqrt(final_dx * final_dx + final_dy * final_dy);
                 
-                // Stop when very close to final waypoint
-                if (final_waypoint_dist < 0.15) {
+                // Stop completely when close enough to final waypoint AND angular error is small
+                // This prevents oscillation around the final waypoint
+                double abs_ang_error_final = std::abs(dirDiff);
+                if (final_waypoint_dist < 0.2 && abs_ang_error_final < 0.2) {  // Within 20cm and < 11 deg error
+                    should_stop_completely = true;
+                    targetSpeed = 0.0;
+                } else if (final_waypoint_dist < 0.15) {
+                    // Very close - stop forward motion but allow small rotation if needed
                     targetSpeed = 0.0;
                 } else if (final_waypoint_dist < 0.5) {
                     targetSpeed = max_linear_speed * (final_waypoint_dist / 0.5) * speed_reduction_factor;
@@ -419,9 +482,17 @@ int main(int argc, char** argv)
             }
 
             // Forward + Angular control: move forward, turn toward path
-            cmd_vel.twist.linear.x = vehicleSpeed;  // Forward velocity in vehicle frame
-            cmd_vel.twist.linear.y = 0.0;           // No lateral movement
-            cmd_vel.twist.angular.z = vehicleYawRate; // Turn toward path
+            // If we should stop completely at final waypoint, stop all motion
+            if (should_stop_completely) {
+                cmd_vel.twist.linear.x = 0.0;
+                cmd_vel.twist.linear.y = 0.0;
+                cmd_vel.twist.angular.z = 0.0;
+                vehicleSpeed = 0.0;  // Reset speed for next iteration
+            } else {
+                cmd_vel.twist.linear.x = vehicleSpeed;  // Forward velocity in vehicle frame
+                cmd_vel.twist.linear.y = 0.0;           // No lateral movement
+                cmd_vel.twist.angular.z = vehicleYawRate; // Turn toward path
+            }
 
             // Publish derivatives for debugging/visualization
             // Use the same timing as PD controller for consistency
@@ -458,6 +529,32 @@ int main(int argc, char** argv)
             sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
             pubGo2Request->publish(req);
 
+            // If we've reached the final waypoint and stopped, exit the control loop
+            if (should_stop_completely) {
+                RCLCPP_INFO(nh->get_logger(), "Final waypoint reached! Distance: %.3f m, Angular error: %.3f rad. Stopping robot.", 
+                           final_waypoint_dist, std::abs(dirDiff));
+                std::cout << "=== FINAL WAYPOINT REACHED ===" << std::endl;
+                std::cout << "Final position: (" << current_x << ", " << current_y << ")" << std::endl;
+                std::cout << "Target position: (" << waypoints_x[waypoints_x.size() - 1] << ", " 
+                          << waypoints_y[waypoints_y.size() - 1] << ")" << std::endl;
+                std::cout << "Distance to final waypoint: " << final_waypoint_dist << " m" << std::endl;
+                std::cout << "Robot stopped successfully." << std::endl;
+                
+                // Keep sending stop commands for a few seconds to ensure robot stops
+                for (int stop_count = 0; stop_count < 50; stop_count++) {  // 0.5 seconds at 100Hz
+                    cmd_vel.twist.linear.x = 0.0;
+                    cmd_vel.twist.linear.y = 0.0;
+                    cmd_vel.twist.angular.z = 0.0;
+                    pubSpeed->publish(cmd_vel);
+                    sport_req.Move(req, 0, 0, 0);
+                    pubGo2Request->publish(req);
+                    rate.sleep();
+                    rclcpp::spin_some(nh);
+                }
+                
+                break;  // Exit the main control loop
+            }
+
             if(seconds % 1 == 0){
                 std::cout << "=== Status Update ===" << std::endl;
                 std::cout << "Localization rate: " << odom_rate << " Hz (received " << odom_count << " messages)" << std::endl;
@@ -468,6 +565,9 @@ int main(int argc, char** argv)
                 std::cout << "Lookahead point: (" << tx << ", " << ty << "), distance=" << lookahead_dist << std::endl;
                 std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
                 std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
+                if (is_final_waypoint) {
+                    std::cout << "Final waypoint distance: " << final_waypoint_dist << " m" << std::endl;
+                }
             }
         } else {
             // All waypoints reached - stop the robot
