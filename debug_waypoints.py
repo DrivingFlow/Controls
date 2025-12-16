@@ -190,8 +190,11 @@ def main():
     # trajectory history data storage (similar to plot_localization_xy.py)
     x_history = deque(maxlen=10000)
     y_history = deque(maxlen=10000)
+    time_history = deque(maxlen=10000)  # Store timestamps for each point
 
     start_time = time.time()
+    last_timestamp_time = start_time  # Track when last timestamp was added
+    timestamp_annotations = []  # Store timestamp text annotations
 
     # autoscale to include waypoints and robot
     margin = 1.0
@@ -205,6 +208,7 @@ def main():
         ax.set_ylim(-5, 5)
 
     def update(frame):
+        nonlocal last_timestamp_time, timestamp_annotations
         now = time.time()
         t = now - start_time
 
@@ -247,10 +251,31 @@ def main():
             # add to history (similar to plot_localization_xy.py)
             x_history.append(rx)
             y_history.append(ry)
+            time_history.append(t)
 
             # update trajectory line
             if len(x_history) > 1:
                 traj_line.set_data(list(x_history), list(y_history))
+
+            # Add timestamp annotation every 10 seconds
+            if now - last_timestamp_time >= 10.0:
+                # Format time as MM:SS or HH:MM:SS if longer
+                elapsed_seconds = int(t)
+                minutes = elapsed_seconds // 60
+                seconds = elapsed_seconds % 60
+                if minutes > 0:
+                    time_str = f"{minutes}:{seconds:02d}"
+                else:
+                    time_str = f"{seconds}s"
+                
+                # Add annotation at current robot position
+                annotation = ax.annotate(time_str, (rx, ry), 
+                                       fontsize=8, color='black',
+                                       bbox=dict(boxstyle='round,pad=0.3', 
+                                               facecolor='yellow', alpha=0.7),
+                                       ha='center', va='bottom')
+                timestamp_annotations.append(annotation)
+                last_timestamp_time = now
 
             robot_point.set_data([rx], [ry])
             # Update quiver in-place (much faster than recreating)
