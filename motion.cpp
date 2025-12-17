@@ -389,20 +389,27 @@ int main(int argc, char** argv)
             // PD controller: P term + D term (derivative provides damping) + Lateral error correction
             double vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative + lateral_correction;
             
-            // Adaptive angular speed limit: reduce max speed when error is large to prevent saturation
-            // This prevents constant saturation at ±0.35 rad/s
-            double adaptive_max_angular = max_angular_speed;
+            // Adaptive angular speed limit: allow faster turning when error is large for quicker correction
+            // Different limits for left (positive) and right (negative) turns due to hardware asymmetry
+            double max_angular_left = max_angular_speed;  // 0.25 for left turns
+            double max_angular_right = 0.4;  // 0.4 for right turns (hardware compensation)
+            
             double abs_error = std::abs(dirDiff);
             if (abs_error > M_PI / 3.0) {  // Error > 60 degrees
-                // Reduce max angular speed when error is very large
-                adaptive_max_angular = max_angular_speed * 0.7;
+                // Allow full speed when error is very large for faster correction
+                // Keep at base values (no reduction)
+                max_angular_left = max_angular_speed;  // 0.25
+                max_angular_right = 0.4;
             } else if (abs_error > M_PI / 6.0) {  // Error > 30 degrees
-                adaptive_max_angular = max_angular_speed * 0.85;
+                // Slightly reduce speed for medium errors to prevent overshoot
+                max_angular_left = max_angular_speed * 0.9;  // 0.225
+                max_angular_right = 0.4 * 0.9;  // 0.36
             }
+            // For small errors (<= 30 degrees), use base values for precise control
             
-            // Limit angular velocity
-            if (vehicleYawRate > adaptive_max_angular) vehicleYawRate = adaptive_max_angular;
-            if (vehicleYawRate < -adaptive_max_angular) vehicleYawRate = -adaptive_max_angular;
+            // Limit angular velocity with different limits for left vs right turns
+            if (vehicleYawRate > max_angular_left) vehicleYawRate = max_angular_left;
+            if (vehicleYawRate < -max_angular_right) vehicleYawRate = -max_angular_right;
 
             // Determine target forward speed based on:
             // 1. Angular error (CRITICAL: stop or nearly stop when error is large)
@@ -440,7 +447,9 @@ int main(int argc, char** argv)
             double abs_yaw_rate = std::abs(vehicleYawRate);
             if (abs_yaw_rate > 0.05) {  // If turning faster than 0.05 rad/s (lowered threshold)
                 // More aggressive: reduce speed significantly when turning
-                double yaw_rate_factor = std::max(0.3, 1.0 - (abs_yaw_rate / adaptive_max_angular) * 0.7);
+                // Use the appropriate max angular speed based on turn direction
+                double current_max_angular = (vehicleYawRate > 0) ? max_angular_left : max_angular_right;
+                double yaw_rate_factor = std::max(0.3, 1.0 - (abs_yaw_rate / current_max_angular) * 0.7);
                 speed_reduction_factor *= yaw_rate_factor;
             }
             
