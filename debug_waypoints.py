@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TwistStamped
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32
 
 import threading
 import argparse
@@ -36,6 +36,10 @@ class DebugVisualizer(Node):
         # derivatives (if published by controller)
         self.latest_deriv_ang = {'val': 0.0, 'got': False}
         self.latest_deriv_lin = {'val': 0.0, 'got': False}
+        
+        # waypoint indices (for visualization)
+        self.lookahead_waypoint_idx = {'val': -1, 'got': False}
+        self.current_waypoint_idx = {'val': -1, 'got': False}
 
         # estimator state (previous command value/time)
         self._prev_cmd_lin_x = None
@@ -52,6 +56,10 @@ class DebugVisualizer(Node):
         # up the topic names and whether to use them.
         self.sub_deriv_ang = None
         self.sub_deriv_lin = None
+        
+        # waypoint index subscribers (set up in main)
+        self.sub_lookahead_waypoint = None
+        self.sub_current_waypoint = None
 
     def odom_cb(self, msg: Odometry):
         with self.lock:
@@ -87,6 +95,16 @@ class DebugVisualizer(Node):
         with self.lock:
             self.latest_deriv_lin['val'] = float(msg.data)
             self.latest_deriv_lin['got'] = True
+    
+    def lookahead_waypoint_cb(self, msg: Int32):
+        with self.lock:
+            self.lookahead_waypoint_idx['val'] = int(msg.data)
+            self.lookahead_waypoint_idx['got'] = True
+    
+    def current_waypoint_cb(self, msg: Int32):
+        with self.lock:
+            self.current_waypoint_idx['val'] = int(msg.data)
+            self.current_waypoint_idx['got'] = True
 
 
 def read_waypoints(csv_path):
@@ -137,6 +155,8 @@ def main():
     parser.add_argument('--derivative-topic-angular', default='/pd_derivative/angular', help='Angular derivative topic (std_msgs/Float32)')
     parser.add_argument('--derivative-topic-linear', default='/pd_derivative/linear', help='Linear derivative topic (std_msgs/Float32)')
     parser.add_argument('--derivative-source', choices=['publish', 'estimate'], default='publish', help='Source for derivative: "publish" to subscribe, "estimate" to numerically differentiate commands')
+    parser.add_argument('--waypoint-topic-lookahead', default='/waypoint/lookahead', help='Lookahead waypoint index topic (std_msgs/Int32)')
+    parser.add_argument('--waypoint-topic-current', default='/waypoint/current', help='Current waypoint index topic (std_msgs/Int32)')
     parser.add_argument('--rate', type=float, default=10.0, help='Plot update rate (Hz)')
     args = parser.parse_args()
 
@@ -154,6 +174,10 @@ def main():
         # subscribe to published derivative values
         node.sub_deriv_ang = node.create_subscription(Float32, args.derivative_topic_angular, node.deriv_ang_cb, 10)
         node.sub_deriv_lin = node.create_subscription(Float32, args.derivative_topic_linear, node.deriv_lin_cb, 10)
+    
+    # subscribe to waypoint indices
+    node.sub_lookahead_waypoint = node.create_subscription(Int32, args.waypoint_topic_lookahead, node.lookahead_waypoint_cb, 10)
+    node.sub_current_waypoint = node.create_subscription(Int32, args.waypoint_topic_current, node.current_waypoint_cb, 10)
 
     # start rclpy spinner in a background thread
     spin_thread = threading.Thread(target=start_rclpy_node, args=(node,), daemon=True)
@@ -168,10 +192,13 @@ def main():
     ax.grid(True)
     ax.set_aspect('equal', adjustable='box')
 
-    # waypoints
+    # waypoints - will be colored dynamically based on status
     wp_x = [p[0] for p in waypoints]
     wp_y = [p[1] for p in waypoints]
-    line_wp, = ax.plot(wp_x, wp_y, '-o', color='tab:blue', label='waypoints')
+    # Create scatter plot for waypoints so we can color them individually
+    wp_scatter = ax.scatter(wp_x, wp_y, c='tab:blue', s=100, marker='o', label='waypoints', zorder=5)
+    # Also draw lines between waypoints
+    line_wp, = ax.plot(wp_x, wp_y, '-', color='tab:blue', alpha=0.3, linewidth=1, zorder=1)
 
     # trajectory history line (distinct color from waypoints, avoiding red/green)
     traj_line, = ax.plot([], [], '-', color='tab:orange', linewidth=2, label='Trajectory History')
@@ -221,6 +248,10 @@ def main():
             lx = node.latest_cmd['lin_x']
             ly = node.latest_cmd['lin_y']
             az = node.latest_cmd['ang_z']
+            
+            # get waypoint indices
+            lookahead_idx = node.lookahead_waypoint_idx['val'] if node.lookahead_waypoint_idx['got'] else -1
+            current_idx = node.current_waypoint_idx['val'] if node.current_waypoint_idx['got'] else -1
 
             # determine derivative values
             deriv_ang_value = None
@@ -246,6 +277,25 @@ def main():
                     # update prev
                     node._prev_cmd_lin_x = lx
                     node._prev_cmd_time = node.latest_cmd_time
+            
+            # Update waypoint colors based on status
+            if len(wp_x) > 0:
+                wp_colors = []
+                for idx in range(len(wp_x)):
+                    if current_idx >= 0 and idx < current_idx:
+                        # Passed waypoints - grey
+                        wp_colors.append('grey')
+                    elif lookahead_idx >= 0 and idx == lookahead_idx:
+                        # Lookahead waypoint (next waypoint) - yellow
+                        wp_colors.append('yellow')
+                    else:
+                        # Future waypoints - blue
+                        wp_colors.append('tab:blue')
+                
+                # Update scatter plot colors (only if we have valid indices or want to reset to default)
+                if len(wp_colors) == len(wp_x):
+                    wp_scatter.set_facecolors(wp_colors)
+                    wp_scatter.set_edgecolors(wp_colors)
 
         if got_pose:
             # add to history (similar to plot_localization_xy.py)
@@ -313,10 +363,13 @@ def main():
                 ax.set_ylim(min_y - margin, max_y + margin)
 
         # update cmd text
-        txt = f"cmd lin_x={lx:.3f}, lin_y={ly:.3f}, ang_z={az:.3f}\npose got={got_pose}, cmd got={got_cmd}"
+        waypoint_info = ""
+        if current_idx >= 0 or lookahead_idx >= 0:
+            waypoint_info = f"\ncurrent wp={current_idx}, lookahead wp={lookahead_idx}"
+        txt = f"cmd lin_x={lx:.3f}, lin_y={ly:.3f}, ang_z={az:.3f}\npose got={got_pose}, cmd got={got_cmd}{waypoint_info}"
         cmd_text.set_text(txt)
 
-        return line_wp, traj_line, robot_point, quiv, cmd_text
+        return line_wp, traj_line, robot_point, quiv, cmd_text, wp_scatter
 
     ani = animation.FuncAnimation(fig, update, interval=1000.0/args.rate, blit=False, cache_frame_data=False)
     

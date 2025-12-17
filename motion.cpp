@@ -10,6 +10,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/int32.hpp>
 
 #include "unitree_api/msg/request.hpp"
 #include "common/ros2_sport_client.h"
@@ -48,7 +49,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<double>("max_angular_speed", 0.25);  // Reduced from 0.35 to prevent saturation
 
     // Local variables to hold parameter values (defaults mirrored in declare_parameter)
-    double lookAheadDis = 1.2;
+    double lookAheadDis = 0.8;
     double yawRateGain = 0.6;
     double yawDerivativeGain = 0.4;
     double lateralErrorGain = 0.8;
@@ -125,6 +126,9 @@ int main(int argc, char** argv)
     // Visualizer `debug_waypoints.py` subscribes to these topics
     auto pubDerivativeAng = nh->create_publisher<std_msgs::msg::Float32>("/pd_derivative/angular", 10);
     auto pubDerivativeLin = nh->create_publisher<std_msgs::msg::Float32>("/pd_derivative/linear", 10);
+    // Publishers for waypoint indices for visualization
+    auto pubLookaheadWaypoint = nh->create_publisher<std_msgs::msg::Int32>("/waypoint/lookahead", 10);
+    auto pubCurrentWaypoint = nh->create_publisher<std_msgs::msg::Int32>("/waypoint/current", 10);
     
     auto sub_odom = nh->create_subscription<nav_msgs::msg::Odometry>(
         "/localization", 10,
@@ -214,6 +218,15 @@ int main(int argc, char** argv)
             sport_req.Move(req, 0, 0, 0);
             pubGo2Request->publish(req);
             
+            // Publish waypoint indices even during initial wait
+            std_msgs::msg::Int32 lookahead_msg;
+            lookahead_msg.data = pathPointID;
+            pubLookaheadWaypoint->publish(lookahead_msg);
+            
+            std_msgs::msg::Int32 current_msg;
+            current_msg.data = i;
+            pubCurrentWaypoint->publish(current_msg);
+            
             state = 0;
         }else{
             state = 1;
@@ -266,7 +279,7 @@ int main(int argc, char** argv)
             // This prevents advancing when robot is far laterally even if Euclidean distance is small
             double abs_dx = std::abs(dist_i_dx);
             double abs_dy = std::abs(dist_i_dy);
-            if (abs_dx < 0.15 && abs_dy < 0.15 && i < (int)waypoints_x.size() - 1) {
+            if (abs_dx < 0.05 && abs_dy < 0.05 && i < (int)waypoints_x.size() - 1) {
                 should_advance = true;
             }
             
@@ -534,6 +547,15 @@ int main(int argc, char** argv)
             prev_lin_error = lookahead_dist;
             prev_lin_time = now_ang;
 
+            // Publish waypoint indices for visualization
+            std_msgs::msg::Int32 lookahead_msg;
+            lookahead_msg.data = pathPointID;
+            pubLookaheadWaypoint->publish(lookahead_msg);
+            
+            std_msgs::msg::Int32 current_msg;
+            current_msg.data = i;
+            pubCurrentWaypoint->publish(current_msg);
+
             pubSpeed->publish(cmd_vel);
             sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
             pubGo2Request->publish(req);
@@ -586,6 +608,15 @@ int main(int argc, char** argv)
             pubSpeed->publish(cmd_vel);
             sport_req.Move(req, 0, 0, 0);
             pubGo2Request->publish(req);
+            
+            // Publish final waypoint indices
+            std_msgs::msg::Int32 lookahead_msg;
+            lookahead_msg.data = (int)waypoints_x.size() - 1;
+            pubLookaheadWaypoint->publish(lookahead_msg);
+            
+            std_msgs::msg::Int32 current_msg;
+            current_msg.data = (int)waypoints_x.size() - 1;
+            pubCurrentWaypoint->publish(current_msg);
             
             std::cout << "All waypoints reached! Stopping robot." << std::endl;
             break;
