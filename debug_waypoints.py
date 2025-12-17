@@ -14,6 +14,7 @@ import time
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.patches as patches
 import numpy as np
 
 from collections import deque
@@ -207,6 +208,9 @@ def main():
     robot_point, = ax.plot([], [], 'o', color='tab:purple', markersize=10, label='robot')
     # Initialize quiver with dummy data - we'll update it each frame
     quiv = ax.quiver([0], [0], [1], [0], angles='xy', scale_units='xy', scale=1, color='tab:purple', width=0.006)
+    # Circle around robot (5cm radius, relatively transparent)
+    robot_circle = patches.Circle((0, 0), 0.05, color='tab:purple', alpha=0.3, fill=True, zorder=3)
+    ax.add_patch(robot_circle)
 
     # text for cmd values
     cmd_text = ax.text(0.02, 0.98, '', transform=ax.transAxes, verticalalignment='top',
@@ -334,6 +338,8 @@ def main():
             uy = math.sin(ryaw) * arrow_len
             quiv.set_offsets([[rx, ry]])
             quiv.set_UVC(ux, uy)
+            # Update robot circle position
+            robot_circle.center = (rx, ry)
 
             # auto-scale axes to fit trajectory with margin (similar to plot_localization_xy.py)
             if len(x_history) > 0:
@@ -369,7 +375,7 @@ def main():
         txt = f"cmd lin_x={lx:.3f}, lin_y={ly:.3f}, ang_z={az:.3f}\npose got={got_pose}, cmd got={got_cmd}{waypoint_info}"
         cmd_text.set_text(txt)
 
-        return line_wp, traj_line, robot_point, quiv, cmd_text, wp_scatter
+        return line_wp, traj_line, robot_point, quiv, cmd_text, wp_scatter, robot_circle
 
     ani = animation.FuncAnimation(fig, update, interval=1000.0/args.rate, blit=False, cache_frame_data=False)
     
