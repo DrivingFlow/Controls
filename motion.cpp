@@ -46,7 +46,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<double>("maxAngErrorForForward", 0.785);  // Stop forward motion if error > 45 deg (rad)
     nh->declare_parameter<double>("maxAccel", 0.5);
     nh->declare_parameter<double>("max_linear_speed", 0.4);
-    nh->declare_parameter<double>("max_angular_speed", 0.25);  // Reduced from 0.35 to prevent saturation
+    nh->declare_parameter<double>("max_angular_speed", 0.35);  // Reduced from 0.35 to prevent saturation
 
     // Local variables to hold parameter values (defaults mirrored in declare_parameter)
     double lookAheadDis = 0.8;
@@ -57,7 +57,7 @@ int main(int argc, char** argv)
     double maxAngErrorForForward = 0.785;  // ~45 degrees
     double maxAccel = 0.5;
     double max_linear_speed = 0.4;
-    double max_angular_speed = 0.25;
+    double max_angular_speed = 0.35;
 
     // Read params into local variables (overrides defaults above if provided)
     nh->get_parameter("lookAheadDis", lookAheadDis);
@@ -405,18 +405,18 @@ int main(int argc, char** argv)
             // Adaptive angular speed limit: allow faster turning when error is large for quicker correction
             // Different limits for left (positive) and right (negative) turns due to hardware asymmetry
             double max_angular_left = max_angular_speed;  // 0.25 for left turns
-            double max_angular_right = 0.4;  // 0.4 for right turns (hardware compensation)
+            double max_angular_right = max_angular_speed +0.15;  // 0.4 for right turns (hardware compensation)
             
             double abs_error = std::abs(dirDiff);
             if (abs_error > M_PI / 3.0) {  // Error > 60 degrees
                 // Allow full speed when error is very large for faster correction
                 // Keep at base values (no reduction)
                 max_angular_left = max_angular_speed;  // 0.25
-                max_angular_right = 0.4;
+                max_angular_right = max_angular_speed +0.15;  // 0.4
             } else if (abs_error > M_PI / 6.0) {  // Error > 30 degrees
                 // Slightly reduce speed for medium errors to prevent overshoot
                 max_angular_left = max_angular_speed * 0.9;  // 0.225
-                max_angular_right = 0.4 * 0.9;  // 0.36
+                max_angular_right = (max_angular_speed +0.15) * 0.9;  // 0.36
             }
             // For small errors (<= 30 degrees), use base values for precise control
             
