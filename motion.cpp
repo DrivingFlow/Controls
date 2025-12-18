@@ -47,6 +47,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<double>("maxAccel", 0.5);
     nh->declare_parameter<double>("max_linear_speed", 0.4);
     nh->declare_parameter<double>("max_angular_speed", 0.35);  // Reduced from 0.35 to prevent saturation
+    nh->declare_parameter<double>("pointAcheivedDist", 0.1); // Distance threshold to consider waypoint reached
 
     // Local variables to hold parameter values (defaults mirrored in declare_parameter)
     double lookAheadDis = 0.8;
@@ -58,6 +59,7 @@ int main(int argc, char** argv)
     double maxAccel = 0.5;
     double max_linear_speed = 0.4;
     double max_angular_speed = 0.35;
+    double pointAcheivedDist = 0.1; // Distance threshold to consider waypoint reached
 
     // Read params into local variables (overrides defaults above if provided)
     nh->get_parameter("lookAheadDis", lookAheadDis);
@@ -279,7 +281,7 @@ int main(int argc, char** argv)
             // This prevents advancing when robot is far laterally even if Euclidean distance is small
             double abs_dx = std::abs(dist_i_dx);
             double abs_dy = std::abs(dist_i_dy);
-            if (abs_dx < 0.05 && abs_dy < 0.05 && i < (int)waypoints_x.size() - 1) {
+            if (abs_dx < pointAcheivedDist && abs_dy < pointAcheivedDist && i < (int)waypoints_x.size() - 1) {
                 should_advance = true;
             }
             

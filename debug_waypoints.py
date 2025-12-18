@@ -208,8 +208,8 @@ def main():
     robot_point, = ax.plot([], [], 'o', color='tab:purple', markersize=10, label='robot')
     # Initialize quiver with dummy data - we'll update it each frame
     quiv = ax.quiver([0], [0], [1], [0], angles='xy', scale_units='xy', scale=1, color='tab:purple', width=0.006)
-    # Circle around robot (5cm radius, relatively transparent)
-    robot_circle = patches.Circle((0, 0), 0.05, color='tab:purple', alpha=0.3, fill=True, zorder=3)
+    # Circle around robot (10cm radius, relatively transparent)
+    robot_circle = patches.Circle((0, 0), 0.1, color='tab:purple', alpha=0.3, fill=True, zorder=3)
     ax.add_patch(robot_circle)
 
     # text for cmd values
