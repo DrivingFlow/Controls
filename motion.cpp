@@ -400,7 +400,7 @@ int main(int argc, char** argv)
                     
                     // Project robot position onto path segment
                     float projection = (robot_dx * seg_dx + robot_dy * seg_dy) / (seg_len * seg_len);
-                    projection = std::max(0.0, std::min(1.0, projection));  // Clamp to [0, 1]
+                    projection = std::max(0.0f, std::min(1.0f, projection));  // Clamp to [0, 1]
                     
                     // Closest point on path segment
                     float closest_x = waypoints_x[i] + projection * seg_dx;
@@ -516,7 +516,7 @@ int main(int argc, char** argv)
                 // More aggressive: reduce speed significantly when turning
                 // Use the appropriate max angular speed based on turn direction
                 float current_max_angular = (vehicleYawRate > 0) ? max_angular_left : max_angular_right;
-                float yaw_rate_factor = std::max(MIN_YAW_RATE_FACTOR, 1.0 - (abs_yaw_rate / current_max_angular) * YAW_RATE_REDUCTION);
+                float yaw_rate_factor = std::max(MIN_YAW_RATE_FACTOR, 1.0f - (abs_yaw_rate / current_max_angular) * YAW_RATE_REDUCTION);
                 speed_reduction_factor *= yaw_rate_factor;
             }
             
