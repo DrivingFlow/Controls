@@ -47,7 +47,7 @@ const float MIN_PATH_LENGTH = 0.01f;  // meters, to avoid division by zero
 const float ANGLE_60_DEG = M_PI / 3.0f;
 const float ANGLE_45_DEG = M_PI / 4.0f;
 const float ANGLE_30_DEG = M_PI / 6.0f;
-const float ANGLE_15_DEG = M_PI / 12.0f;
+const float ANGLE_10_DEG = M_PI / 18.0f;
 
 // Speed reduction factors
 const float SPEED_REDUCTION_60DEG = 0.05f;
@@ -499,9 +499,9 @@ int main(int argc, char** argv)
             } else if (abs_ang_error > ANGLE_30_DEG) {  // Error > 30 degrees
                 // Moderate speed reduction: scale from SPEED_REDUCTION_30DEG at 30deg to SPEED_REDUCTION_45DEG at 45deg
                 speed_reduction_factor = SPEED_REDUCTION_45DEG + (SPEED_REDUCTION_30DEG - SPEED_REDUCTION_45DEG) * (1.0 - (abs_ang_error - ANGLE_30_DEG) / (ANGLE_45_DEG - ANGLE_30_DEG));
-            } else if (abs_ang_error > ANGLE_15_DEG) {  // Error > 15 degrees
-                // Light speed reduction: scale from SPEED_REDUCTION_15DEG at 15deg to SPEED_REDUCTION_30DEG at 30deg
-                speed_reduction_factor = SPEED_REDUCTION_30DEG + (SPEED_REDUCTION_15DEG - SPEED_REDUCTION_30DEG) * (1.0 - (abs_ang_error - ANGLE_15_DEG) / (ANGLE_30_DEG - ANGLE_15_DEG));
+            } else if (abs_ang_error > ANGLE_10_DEG) {  // Error > 10 degrees
+                // Light speed reduction: scale from SPEED_REDUCTION_10DEG at 10deg to SPEED_REDUCTION_30DEG at 30deg
+                speed_reduction_factor = SPEED_REDUCTION_30DEG + (SPEED_REDUCTION_10DEG - SPEED_REDUCTION_30DEG) * (1.0 - (abs_ang_error - ANGLE_10_DEG) / (ANGLE_30_DEG - ANGLE_10_DEG));
             }
             
             // Reduce speed when close to lookahead point
