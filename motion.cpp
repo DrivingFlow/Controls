@@ -44,16 +44,16 @@ const float WAYPOINT_PROJECTION_THRESHOLD = 0.8f;  // 80% past waypoint
 const float MIN_PATH_LENGTH = 0.01f;  // meters, to avoid division by zero
 
 // Angular error thresholds
-const float ANGLE_60_DEG = M_PI / 3.0f;
-const float ANGLE_45_DEG = M_PI / 4.0f;
-const float ANGLE_30_DEG = M_PI / 6.0f;
-const float ANGLE_10_DEG = M_PI / 18.0f;
+const float ANGLE_45_DEG = M_PI / 3.0f;
+const float ANGLE_30_DEG = M_PI / 4.0f;
+const float ANGLE_15_DEG = M_PI / 6.0f;
+const float ANGLE_5_DEG = M_PI / 18.0f;
 
 // Speed reduction factors
-const float SPEED_REDUCTION_60DEG = 0.05f;
-const float SPEED_REDUCTION_45DEG = 0.15f;
-const float SPEED_REDUCTION_30DEG = 0.4f;
-const float SPEED_REDUCTION_15DEG = 0.7f;
+const float SPEED_REDUCTION_45DEG = 0.05f;
+const float SPEED_REDUCTION_30DEG = 0.15f;
+const float SPEED_REDUCTION_15DEG = 0.4f;
+const float SPEED_REDUCTION_5DEG = 0.7f;
 const float ANGULAR_SPEED_SCALING = 0.9f;  // For medium angular errors
 
 // Angular velocity control
@@ -462,12 +462,12 @@ int main(int argc, char** argv)
             float max_angular_right = max_angular_speed + RIGHT_TURN_COMPENSATION;  // Hardware compensation
             
             float abs_error = std::abs(dirDiff);
-            if (abs_error > ANGLE_60_DEG) {
+            if (abs_error > ANGLE_45_DEG) {
                 // Allow full speed when error is very large for faster correction
                 // Keep at base values (no reduction)
                 max_angular_left = max_angular_speed;
                 max_angular_right = max_angular_speed + RIGHT_TURN_COMPENSATION;
-            } else if (abs_error > ANGLE_30_DEG) {
+            } else if (abs_error > ANGLE_15_DEG) {
                 // Slightly reduce speed for medium errors to prevent overshoot
                 max_angular_left = max_angular_speed * ANGULAR_SPEED_SCALING;
                 max_angular_right = (max_angular_speed + RIGHT_TURN_COMPENSATION) * ANGULAR_SPEED_SCALING;
@@ -490,18 +490,18 @@ int main(int argc, char** argv)
             if (abs_ang_error > maxAngErrorForForward) {
                 // Error > threshold (default 45 degrees): STOP forward motion, turn in place
                 speed_reduction_factor = 0.0;
-            } else if (abs_ang_error > ANGLE_60_DEG) {  // Error > 60 degrees (but less than maxAngErrorForForward)
-                // Very aggressive speed reduction: scale from SPEED_REDUCTION_60DEG at 60deg to 0.0 at maxAngErrorForForward
-                speed_reduction_factor = SPEED_REDUCTION_60DEG * (1.0 - (abs_ang_error - ANGLE_60_DEG) / (maxAngErrorForForward - ANGLE_60_DEG));
-            } else if (abs_ang_error > ANGLE_45_DEG) {  // Error > 45 degrees
-                // Aggressive speed reduction: scale from SPEED_REDUCTION_45DEG at 45deg to SPEED_REDUCTION_60DEG at 60deg
-                speed_reduction_factor = SPEED_REDUCTION_60DEG + (SPEED_REDUCTION_45DEG - SPEED_REDUCTION_60DEG) * (1.0 - (abs_ang_error - ANGLE_45_DEG) / (ANGLE_60_DEG - ANGLE_45_DEG));
+            } else if (abs_ang_error > ANGLE_45_DEG) {  // Error > 45 degrees (but less than maxAngErrorForForward)
+                // Very aggressive speed reduction: scale from SPEED_REDUCTION_45DEG at 45DEG to 0.0 at maxAngErrorForForward
+                speed_reduction_factor = SPEED_REDUCTION_45DEG * (1.0 - (abs_ang_error - ANGLE_45_DEG) / (maxAngErrorForForward - ANGLE_45_DEG));
             } else if (abs_ang_error > ANGLE_30_DEG) {  // Error > 30 degrees
-                // Moderate speed reduction: scale from SPEED_REDUCTION_30DEG at 30deg to SPEED_REDUCTION_45DEG at 45deg
+                // Aggressive speed reduction: scale from SPEED_REDUCTION_30DEG at 30DEG to SPEED_REDUCTION_45DEG at 45DEG
                 speed_reduction_factor = SPEED_REDUCTION_45DEG + (SPEED_REDUCTION_30DEG - SPEED_REDUCTION_45DEG) * (1.0 - (abs_ang_error - ANGLE_30_DEG) / (ANGLE_45_DEG - ANGLE_30_DEG));
-            } else if (abs_ang_error > ANGLE_10_DEG) {  // Error > 10 degrees
-                // Light speed reduction: scale from SPEED_REDUCTION_10DEG at 10deg to SPEED_REDUCTION_30DEG at 30deg
-                speed_reduction_factor = SPEED_REDUCTION_30DEG + (SPEED_REDUCTION_10DEG - SPEED_REDUCTION_30DEG) * (1.0 - (abs_ang_error - ANGLE_10_DEG) / (ANGLE_30_DEG - ANGLE_10_DEG));
+            } else if (abs_ang_error > ANGLE_15_DEG) {  // Error > 15 degrees
+                // Moderate speed reduction: scale from SPEED_REDUCTION_15DEG at 15DEG to SPEED_REDUCTION_30DEG at 30DEG
+                speed_reduction_factor = SPEED_REDUCTION_30DEG + (SPEED_REDUCTION_15DEG - SPEED_REDUCTION_30DEG) * (1.0 - (abs_ang_error - ANGLE_15_DEG) / (ANGLE_30_DEG - ANGLE_15_DEG));
+            } else if (abs_ang_error > ANGLE_5_DEG) {  // Error > 5 degrees
+                // Light speed reduction: scale from SPEED_REDUCTION_5DEG at 5DEG to SPEED_REDUCTION_15DEG at 15DEG
+                speed_reduction_factor = SPEED_REDUCTION_15DEG + (SPEED_REDUCTION_5DEG - SPEED_REDUCTION_15DEG) * (1.0 - (abs_ang_error - ANGLE_5_DEG) / (ANGLE_15_DEG - ANGLE_5_DEG));
             }
             
             // Reduce speed when close to lookahead point
