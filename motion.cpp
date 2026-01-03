@@ -93,7 +93,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<float>("lookAheadDis", 1.2f);  // Reduced for tighter control
     nh->declare_parameter<float>("yawRateGain", 0.6f);   // Further reduced to prevent saturation
     nh->declare_parameter<float>("yawDerivativeGain", 0.4f);  // Increased for more damping
-    nh->declare_parameter<float>("lateralErrorGain", 0.8f);  // New: gain for lateral error correction
+    nh->declare_parameter<float>("lateralErrorGain", 0.0f);  // Lateral error correction DISABLED (was causing oscillation)
     nh->declare_parameter<float>("yawErrorDeadband", 0.05f);  // Ignore small errors (rad)
     nh->declare_parameter<float>("maxAngErrorForForward", 0.785f);  // Stop forward motion if error > 45 deg (rad)
     nh->declare_parameter<float>("maxAccel", 0.5f);
@@ -105,7 +105,7 @@ int main(int argc, char** argv)
     float lookAheadDis = 0.8f;
     float yawRateGain = 0.6f;
     float yawDerivativeGain = 0.4f;
-    float lateralErrorGain = 0.8f;
+    float lateralErrorGain = 0.0f;  // DISABLED
     float yawErrorDeadband = 0.05f;
     float maxAngErrorForForward = 0.785f;  // ~45 degrees
     float maxAccel = 0.5f;
@@ -426,13 +426,32 @@ int main(int argc, char** argv)
                 // Could add sign based on robot orientation, but for final waypoint it's less critical
             }
 
-            // Angular error between path direction and vehicle yaw
-            float dirDiff = pathDir - current_yaw;
+            // === LATERAL ERROR CORRECTION VIA HEADING ADJUSTMENT (Stanley-style) ===
+            // Instead of adding lateral correction to angular velocity (causes overshoot),
+            // we adjust the TARGET HEADING to include path convergence.
+            // This lets the PD controller handle smoothing naturally.
+            
+            // Calculate heading correction angle based on lateral error
+            // atan2(k * lateral_error, velocity) is the Stanley controller formula
+            // We use lookahead_dist as a proxy for "how far ahead we're looking"
+            float heading_correction = std::atan2(lateralErrorGain * lateral_error, 
+                                                   std::max(lookahead_dist, MIN_LOOKAHEAD_FOR_LATERAL));
+            
+            // Limit heading correction to prevent extreme adjustments (max ~8.5 degrees)
+            const float MAX_HEADING_CORRECTION = 0.15f;  // radians (~8.5 degrees)
+            heading_correction = std::max(-MAX_HEADING_CORRECTION, std::min(MAX_HEADING_CORRECTION, heading_correction));
+            
+            // Adjust target heading: subtract correction because positive lateral_error (left of path)
+            // should result in turning right (reducing the target heading angle)
+            float adjusted_pathDir = pathDir - heading_correction;
+            
+            // Angular error between ADJUSTED path direction and vehicle yaw
+            float dirDiff = adjusted_pathDir - current_yaw;
             // Normalize to [-pi, pi]
             while (dirDiff > M_PI) dirDiff -= 2.0 * M_PI;
             while (dirDiff < -M_PI) dirDiff += 2.0 * M_PI;
 
-            // Angular velocity controller: PD controller (Proportional + Derivative) + Lateral Error Correction
+            // Angular velocity controller: PD controller (Proportional + Derivative)
             // Apply deadband to small errors to reduce jitter
             float dirDiffFiltered = dirDiff;
             if (std::abs(dirDiff) < yawErrorDeadband) {
@@ -446,15 +465,12 @@ int main(int argc, char** argv)
             
             float error_derivative = (dirDiffFiltered - prev_ang_error) / dt_ang;
             
-            // Lateral error correction: steer toward path when there's lateral offset
-            // The correction is proportional to lateral error and inversely proportional to lookahead distance
-            // This creates a "pull" toward the path
-            float lateral_correction = lateralErrorGain * lateral_error / std::max(lookahead_dist, MIN_LOOKAHEAD_FOR_LATERAL);
-            // Limit lateral correction to prevent instability
-            lateral_correction = std::max(MIN_LATERAL_CORRECTION, std::min(MAX_LATERAL_CORRECTION, lateral_correction));
+            // Store lateral correction for debug logging (now it's the heading adjustment, not yaw rate)
+            float lateral_correction = heading_correction;
             
-            // PD controller: P term + D term (derivative provides damping) + Lateral error correction
-            float vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative + lateral_correction;
+            // PD controller: P term + D term (derivative provides damping)
+            // Lateral error is now integrated into dirDiff via heading adjustment above
+            float vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative;
             
             // Adaptive angular speed limit: allow faster turning when error is large for quicker correction
             // Different limits for left (positive) and right (negative) turns due to hardware asymmetry
@@ -647,6 +663,8 @@ int main(int argc, char** argv)
                 std::cout << "Target waypoint: (" << waypoints_x[i] << ", " << waypoints_y[i] << ")" << std::endl;
                 std::cout << "Lookahead point: (" << tx << ", " << ty << "), distance=" << lookahead_dist << std::endl;
                 std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
+                std::cout << "Lateral error: " << lateral_error << " m (+ = left of path, - = right)" << std::endl;
+                std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
                 std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
                 if (is_final_waypoint) {
                     std::cout << "Final waypoint distance: " << final_waypoint_dist << " m" << std::endl;
