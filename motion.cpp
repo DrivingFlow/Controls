@@ -228,6 +228,10 @@ int main(int argc, char** argv)
     auto prev_ang_time = std::chrono::system_clock::now();
     float prev_lin_error = 0.0;
     auto prev_lin_time = std::chrono::system_clock::now();
+    
+    // Overshoot detection: track if we're moving away from target
+    float prev_lookahead_dist = 0.0;
+    const float MOVING_AWAY_THRESHOLD = 0.02f;  // 2cm tolerance before triggering
 
     // Wait for first odometry message
     RCLCPP_INFO(nh->get_logger(), "Waiting for odometry data...");
@@ -451,7 +455,6 @@ int main(int argc, char** argv)
             while (dirDiff > M_PI) dirDiff -= 2.0 * M_PI;
             while (dirDiff < -M_PI) dirDiff += 2.0 * M_PI;
 
-            // Angular velocity controller: PD controller (Proportional + Derivative)
             // Apply deadband to small errors to reduce jitter
             float dirDiffFiltered = dirDiff;
             if (std::abs(dirDiff) < yawErrorDeadband) {
@@ -465,34 +468,28 @@ int main(int argc, char** argv)
             
             float error_derivative = (dirDiffFiltered - prev_ang_error) / dt_ang;
             
-            // Store lateral correction for debug logging (now it's the heading adjustment, not yaw rate)
+            // Store lateral correction for debug logging
             float lateral_correction = heading_correction;
             
-            // PD controller: P term + D term (derivative provides damping)
-            // Lateral error is now integrated into dirDiff via heading adjustment above
-            float vehicleYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative;
+            // === PURE PURSUIT CURVATURE CALCULATION ===
+            // This is the key to smooth arcs instead of zig-zag!
+            // curvature = 2 * sin(alpha) / L, where alpha is angle to target, L is distance
+            float pure_pursuit_curvature = 2.0f * std::sin(dirDiff) / std::max(lookahead_dist, 0.1f);
             
-            // Adaptive angular speed limit: allow faster turning when error is large for quicker correction
-            // Different limits for left (positive) and right (negative) turns due to hardware asymmetry
+            // Adaptive angular speed limits
             float max_angular_left = max_angular_speed;
-            float max_angular_right = max_angular_speed + RIGHT_TURN_COMPENSATION;  // Hardware compensation
+            float max_angular_right = max_angular_speed + RIGHT_TURN_COMPENSATION;
             
-            float abs_error = std::abs(dirDiff);
-            if (abs_error > ANGLE_45_DEG) {
-                // Allow full speed when error is very large for faster correction
-                // Keep at base values (no reduction)
-                max_angular_left = max_angular_speed;
-                max_angular_right = max_angular_speed + RIGHT_TURN_COMPENSATION;
-            } else if (abs_error > ANGLE_15_DEG) {
-                // Slightly reduce speed for medium errors to prevent overshoot
-                max_angular_left = max_angular_speed * ANGULAR_SPEED_SCALING;
-                max_angular_right = (max_angular_speed + RIGHT_TURN_COMPENSATION) * ANGULAR_SPEED_SCALING;
-            }
-            // For small errors (<= 30 degrees), use base values for precise control
+            // PLACEHOLDER: vehicleYawRate will be calculated after we know vehicleSpeed
+            // For now, calculate what it would be in turn-in-place mode (P controller)
+            float turnInPlaceYawRate = yawRateGain * dirDiffFiltered - yawDerivativeGain * error_derivative;
             
-            // Limit angular velocity with different limits for left vs right turns
-            if (vehicleYawRate > max_angular_left) vehicleYawRate = max_angular_left;
-            if (vehicleYawRate < -max_angular_right) vehicleYawRate = -max_angular_right;
+            // Limit turn-in-place yaw rate
+            if (turnInPlaceYawRate > max_angular_left) turnInPlaceYawRate = max_angular_left;
+            if (turnInPlaceYawRate < -max_angular_right) turnInPlaceYawRate = -max_angular_right;
+            
+            // vehicleYawRate will be set after speed calculation (see below)
+            float vehicleYawRate = 0.0f;
 
             // Determine target forward speed based on:
             // 1. Angular error (CRITICAL: stop or nearly stop when error is large)
@@ -536,6 +533,15 @@ int main(int argc, char** argv)
                 speed_reduction_factor *= yaw_rate_factor;
             }
             
+            // OVERSHOOT DETECTION: If distance to lookahead is INCREASING, we're moving away - STOP!
+            // This catches overshoots faster than heading error alone
+            bool moving_away = false;
+            if (prev_lookahead_dist > 0.0f && lookahead_dist > prev_lookahead_dist + MOVING_AWAY_THRESHOLD) {
+                moving_away = true;
+                speed_reduction_factor = 0.0f;  // Stop forward motion immediately
+            }
+            prev_lookahead_dist = lookahead_dist;
+            
             // Check if we're at the final waypoint
             bool is_final_waypoint = (i >= (int)waypoints_x.size() - 1);
             float final_waypoint_dist = 0.0;
@@ -565,12 +571,52 @@ int main(int argc, char** argv)
             }
 
             // Ramp vehicleSpeed toward targetSpeed with acceleration limit
+            // EXCEPTION: If we need to STOP (targetSpeed = 0), stop immediately to prevent overshoot
             float dt = CONTROL_LOOP_DT;
-            float maxDelta = maxAccel * dt;
-            if (vehicleSpeed < targetSpeed) {
-                vehicleSpeed = std::min(targetSpeed, vehicleSpeed + maxDelta);
-            } else if (vehicleSpeed > targetSpeed) {
-                vehicleSpeed = std::max(targetSpeed, vehicleSpeed - maxDelta);
+            if (targetSpeed == 0.0f || moving_away) {
+                // Immediate stop - bypass gradual deceleration to prevent overshoot
+                vehicleSpeed = 0.0f;
+            } else {
+                float maxDelta = maxAccel * dt;
+                if (vehicleSpeed < targetSpeed) {
+                    vehicleSpeed = std::min(targetSpeed, vehicleSpeed + maxDelta);
+                } else if (vehicleSpeed > targetSpeed) {
+                    vehicleSpeed = std::max(targetSpeed, vehicleSpeed - maxDelta);
+                }
+            }
+            
+            // === HYBRID CONTROL: Choose between Turn-in-Place and Pure Pursuit ===
+            // Threshold for switching between modes (~25 degrees)
+            const float PURE_PURSUIT_THRESHOLD = 0.44f;  // radians (~25 degrees)
+            
+            float abs_ang_error_for_mode = std::abs(dirDiff);
+            
+            if (vehicleSpeed < 0.01f || abs_ang_error_for_mode > PURE_PURSUIT_THRESHOLD) {
+                // TURN IN PLACE MODE: Large angular error or stopped
+                // Use P controller to turn toward target
+                vehicleYawRate = turnInPlaceYawRate;
+            } else {
+                // PURE PURSUIT MODE: Small angular error and moving forward
+                // Use curvature-based control: angular velocity = linear velocity × curvature
+                // This creates smooth arcs instead of zig-zags!
+                vehicleYawRate = vehicleSpeed * pure_pursuit_curvature;
+                
+                // Still apply angular velocity limits
+                if (vehicleYawRate > max_angular_left) vehicleYawRate = max_angular_left;
+                if (vehicleYawRate < -max_angular_right) vehicleYawRate = -max_angular_right;
+            }
+            
+            // === ANGULAR OVERSHOOT DETECTION ===
+            // If angular error is INCREASING while we're turning, we're turning the wrong way - STOP!
+            // Same sign of error and derivative means overshooting:
+            //   - Positive error (target left) + positive derivative (error growing) = overshoot
+            //   - Negative error (target right) + negative derivative (error growing) = overshoot
+            const float DERIVATIVE_THRESHOLD = 0.05f;  // Minimum derivative to trigger (reduces noise)
+            bool angular_overshoot = (dirDiff * error_derivative > 0) && (std::abs(error_derivative) > DERIVATIVE_THRESHOLD);
+            
+            if (angular_overshoot) {
+                // STOP turning completely - we're going the wrong way!
+                vehicleYawRate = 0.0f;
             }
 
             // Forward + Angular control: move forward, turn toward path
@@ -666,6 +712,14 @@ int main(int argc, char** argv)
                 std::cout << "Lateral error: " << lateral_error << " m (+ = left of path, - = right)" << std::endl;
                 std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
                 std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
+                std::cout << "Control mode: " << (vehicleSpeed < 0.01f || abs_ang_error_for_mode > 0.44f ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
+                std::cout << "Pure pursuit curvature: " << pure_pursuit_curvature << " m^-1" << std::endl;
+                if (moving_away) {
+                    std::cout << "*** OVERSHOOT DETECTED: Moving away from target! ***" << std::endl;
+                }
+                if (angular_overshoot) {
+                    std::cout << "*** ANGULAR OVERSHOOT: Error increasing, stopped turning! ***" << std::endl;
+                }
                 if (is_final_waypoint) {
                     std::cout << "Final waypoint distance: " << final_waypoint_dist << " m" << std::endl;
                 }
