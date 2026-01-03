@@ -66,6 +66,7 @@ const float YAW_RATE_REDUCTION = 0.7f;
 const float MIN_LOOKAHEAD_FOR_LATERAL = 0.5f;  // meters
 const float MAX_LATERAL_CORRECTION = 0.3f;  // rad/s
 const float MIN_LATERAL_CORRECTION = -0.3f;  // rad/s
+const float MAX_LATERAL_SPEED = 0.1f;  // m/s - max sideways velocity for direct lateral correction
 
 // Proximity-based speed control
 const float PROXIMITY_DISTANCE = 1.0f;  // meters
@@ -619,7 +620,17 @@ int main(int argc, char** argv)
                 vehicleYawRate = 0.0f;
             }
 
-            // Forward + Angular control: move forward, turn toward path
+            // === LATERAL VELOCITY CORRECTION ===
+            // Use linear.y to directly slide toward the path (holonomic motion)
+            // This is much more effective than trying to correct through heading changes!
+            // lateral_error > 0 means robot is LEFT of path → need to move RIGHT (negative Y)
+            float lateral_velocity = -lateralErrorGain * lateral_error;
+            
+            // Clamp to max lateral speed (gentle sideways motion)
+            if (lateral_velocity > MAX_LATERAL_SPEED) lateral_velocity = MAX_LATERAL_SPEED;
+            if (lateral_velocity < -MAX_LATERAL_SPEED) lateral_velocity = -MAX_LATERAL_SPEED;
+            
+            // Forward + Lateral + Angular control
             // If we should stop completely at final waypoint, stop all motion
             if (should_stop_completely) {
                 cmd_vel.twist.linear.x = 0.0;
@@ -627,9 +638,9 @@ int main(int argc, char** argv)
                 cmd_vel.twist.angular.z = 0.0;
                 vehicleSpeed = 0.0;  // Reset speed for next iteration
             } else {
-                cmd_vel.twist.linear.x = vehicleSpeed;  // Forward velocity in vehicle frame
-                cmd_vel.twist.linear.y = 0.0;           // No lateral movement
-                cmd_vel.twist.angular.z = vehicleYawRate; // Turn toward path
+                cmd_vel.twist.linear.x = vehicleSpeed;      // Forward velocity in vehicle frame
+                cmd_vel.twist.linear.y = lateral_velocity;  // Sideways correction toward path
+                cmd_vel.twist.angular.z = vehicleYawRate;   // Face the path direction
             }
 
             // Publish derivatives for debugging/visualization
@@ -711,7 +722,7 @@ int main(int argc, char** argv)
                 std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
                 std::cout << "Lateral error: " << lateral_error << " m (+ = left of path, - = right)" << std::endl;
                 std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
-                std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
+                std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", linear.y=" << cmd_vel.twist.linear.y << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
                 std::cout << "Control mode: " << (vehicleSpeed < 0.01f || abs_ang_error_for_mode > 0.44f ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
                 std::cout << "Pure pursuit curvature: " << pure_pursuit_curvature << " m^-1" << std::endl;
                 if (moving_away) {
