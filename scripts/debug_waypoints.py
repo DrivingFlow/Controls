@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TwistStamped, PoseWithCovarianceStamped
+from std_msgs.msg import Float32, Int32
+
+import threading
+import argparse
+import csv
+import math
+import time
+
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib.patches as patches
+import numpy as np
+
+from collections import deque
+
+
+class DebugVisualizer(Node):
+    def __init__(self, waypoints, odom_topic, cmd_topic):
+        super().__init__('debug_waypoints')
+        self.get_logger().info(f"Starting DebugVisualizer: odom_topic={odom_topic}, cmd_topic={cmd_topic}")
+
+        self.waypoints = waypoints
+
+        # Latest data
+        self.lock = threading.Lock()
+        self.latest_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'got': False}
+        self.latest_cmd = {'lin_x': 0.0, 'lin_y': 0.0, 'ang_z': 0.0, 'got': False}
+        # time at which latest_cmd was received (for estimation)
+        self.latest_cmd_time = None
+
+        # derivatives (if published by controller)
+        self.latest_deriv_ang = {'val': 0.0, 'got': False}
+        self.latest_deriv_lin = {'val': 0.0, 'got': False}
+        
+        # waypoint indices (for visualization)
+        self.lookahead_waypoint_idx = {'val': -1, 'got': False}
+        self.current_waypoint_idx = {'val': -1, 'got': False}
+
+        # estimator state (previous command value/time)
+        self._prev_cmd_lin_x = None
+        self._prev_cmd_time = None
+        # default derivative source; may be overridden by main when creating node
+        self.derivative_source = 'publish'
+
+        # QoS profile to match TRANSIENT_LOCAL durability from lidar_localization
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        self.sub_odom = self.create_subscription(
+            PoseWithCovarianceStamped, odom_topic, self.odom_cb, qos_profile)
+        self.get_logger().info(f"Subscribed to odometry topic: {odom_topic}")
+        self.sub_cmd = self.create_subscription(
+            TwistStamped, cmd_topic, self.cmd_cb, 10)
+        self.get_logger().info(f"Subscribed to command topic: {cmd_topic}")
+
+        # optionally subscribe to published derivatives; main() will set
+        # up the topic names and whether to use them.
+        self.sub_deriv_ang = None
+        self.sub_deriv_lin = None
+        
+        # waypoint index subscribers (set up in main)
+        self.sub_lookahead_waypoint = None
+        self.sub_current_waypoint = None
+
+    def odom_cb(self, msg: PoseWithCovarianceStamped):
+        try:
+            with self.lock:
+                px = msg.pose.pose.position.x
+                py = msg.pose.pose.position.y
+                q = msg.pose.pose.orientation
+                # quaternion to yaw
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                self.latest_pose['x'] = px
+                self.latest_pose['y'] = py
+                self.latest_pose['yaw'] = yaw
+                self.latest_pose['got'] = True
+        except Exception as e:
+            self.get_logger().error(f"Error in odom_cb: {e}", exc_info=True)
+
+    def cmd_cb(self, msg: TwistStamped):
+        with self.lock:
+            self.latest_cmd['lin_x'] = msg.twist.linear.x
+            self.latest_cmd['lin_y'] = msg.twist.linear.y
+            # try angular.z, handle different message shapes if needed
+            self.latest_cmd['ang_z'] = getattr(msg.twist.angular, 'z', 0.0)
+            self.latest_cmd['got'] = True
+            # record arrival time for numerical differentiation
+            now = time.time()
+            self.latest_cmd_time = now
+
+    def deriv_ang_cb(self, msg: Float32):
+        with self.lock:
+            self.latest_deriv_ang['val'] = float(msg.data)
+            self.latest_deriv_ang['got'] = True
+    
+    def deriv_lin_cb(self, msg: Float32):
+        with self.lock:
+            self.latest_deriv_lin['val'] = float(msg.data)
+            self.latest_deriv_lin['got'] = True
+    
+    def lookahead_waypoint_cb(self, msg: Int32):
+        with self.lock:
+            self.lookahead_waypoint_idx['val'] = int(msg.data)
+            self.lookahead_waypoint_idx['got'] = True
+    
+    def current_waypoint_cb(self, msg: Int32):
+        with self.lock:
+            self.current_waypoint_idx['val'] = int(msg.data)
+            self.current_waypoint_idx['got'] = True
+
+
+def read_waypoints(csv_path):
+    waypoints = []
+    with open(csv_path, 'r') as fh:
+        reader = csv.reader(fh)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise RuntimeError('Waypoints CSV is empty')
+
+        # find x and y columns (case-insensitive)
+        x_col = y_col = -1
+        for i, col in enumerate(header):
+            name = col.strip().lower()
+            if name == 'x':
+                x_col = i
+            if name == 'y':
+                y_col = i
+        if x_col == -1 or y_col == -1:
+            # fallback: try common formats sec,nsec,x,y -> choose columns named like 'x' or 'y' anywhere
+            # if still not found, raise with helpful message
+            raise RuntimeError(f"Could not find 'x' and 'y' columns in CSV header: {header}")
+
+        for row in reader:
+            if len(row) <= max(x_col, y_col):
+                continue
+            try:
+                x = float(row[x_col].strip())
+                y = float(row[y_col].strip())
+                waypoints.append((x, y))
+            except ValueError:
+                # skip malformed rows
+                continue
+    return waypoints
+
+
+def start_rclpy_node(node):
+    # rclpy.spin must run in its own thread so matplotlib (main thread) can run
+    rclpy.spin(node)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Debug waypoints visualizer')
+    parser.add_argument('--csv', '-c', default='/home/dog22/calib_imu/src/mover/src/waypoints.csv', help='Path to waypoints CSV')
+    parser.add_argument('--odom', default='/pcl_pose', help='Odometry topic (geometry_msgs/PoseWithCovarianceStamped)')
+    parser.add_argument('--cmd', default='/cmd_vel', help='Motion command topic (geometry_msgs/TwistStamped)')
+    parser.add_argument('--derivative-topic-angular', default='/pd_derivative/angular', help='Angular derivative topic (std_msgs/Float32)')
+    parser.add_argument('--derivative-topic-linear', default='/pd_derivative/linear', help='Linear derivative topic (std_msgs/Float32)')
+    parser.add_argument('--derivative-source', choices=['publish', 'estimate'], default='publish', help='Source for derivative: "publish" to subscribe, "estimate" to numerically differentiate commands')
+    parser.add_argument('--waypoint-topic-lookahead', default='/waypoint/lookahead', help='Lookahead waypoint index topic (std_msgs/Int32)')
+    parser.add_argument('--waypoint-topic-current', default='/waypoint/current', help='Current waypoint index topic (std_msgs/Int32)')
+    parser.add_argument('--rate', type=float, default=10.0, help='Plot update rate (Hz)')
+    args = parser.parse_args()
+
+    try:
+        waypoints = read_waypoints(args.csv)
+    except Exception as e:
+        print(f"Failed to read waypoints: {e}")
+        return 1
+
+    rclpy.init()
+    node = DebugVisualizer(waypoints, args.odom, args.cmd)
+    # configure derivative source and subscription
+    node.derivative_source = args.derivative_source
+    if args.derivative_source == 'publish':
+        # subscribe to published derivative values
+        node.sub_deriv_ang = node.create_subscription(Float32, args.derivative_topic_angular, node.deriv_ang_cb, 10)
+        node.sub_deriv_lin = node.create_subscription(Float32, args.derivative_topic_linear, node.deriv_lin_cb, 10)
+    
+    # subscribe to waypoint indices
+    node.sub_lookahead_waypoint = node.create_subscription(Int32, args.waypoint_topic_lookahead, node.lookahead_waypoint_cb, 10)
+    node.sub_current_waypoint = node.create_subscription(Int32, args.waypoint_topic_current, node.current_waypoint_cb, 10)
+
+    # start rclpy spinner in a background thread
+    spin_thread = threading.Thread(target=start_rclpy_node, args=(node,), daemon=True)
+    spin_thread.start()
+    
+    # Give subscriptions time to connect
+    time.sleep(2)
+    
+    # Check if topics are available
+    from rclpy.topic_endpoint_info import TopicEndpointInfo
+    topic_list = node.get_topic_names_and_types()
+    print("\n=== Available Topics ===")
+    for topic, types in topic_list:
+        if 'pcl' in topic.lower() or 'pose' in topic.lower() or 'cmd' in topic.lower():
+            print(f"  {topic}: {types}")
+    print("======================\n")
+
+    # prepare matplotlib: single plot (derivative plot hidden)
+    plt.ion()
+    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+    ax.set_title('Waypoints + Robot Pose')
+    ax.set_xlabel('X (forward)')
+    ax.set_ylabel('Y (left)')
+    ax.grid(True)
+    ax.set_aspect('equal', adjustable='box')
+
+    # waypoints - will be colored dynamically based on status
+    wp_x = [p[0] for p in waypoints]
+    wp_y = [p[1] for p in waypoints]
+    # Create scatter plot for waypoints so we can color them individually
+    wp_scatter = ax.scatter(wp_x, wp_y, c='tab:blue', s=100, marker='o', label='waypoints', zorder=5)
+    # Also draw lines between waypoints
+    line_wp, = ax.plot(wp_x, wp_y, '-', color='tab:blue', alpha=0.3, linewidth=1, zorder=1)
+
+    # trajectory history line (distinct color from waypoints, avoiding red/green)
+    traj_line, = ax.plot([], [], '-', color='tab:orange', linewidth=2, label='Trajectory History')
+
+    # robot marker and orientation arrow (using purple/cyan instead of red)
+    robot_point, = ax.plot([], [], 'o', color='tab:purple', markersize=10, label='robot')
+    # Initialize quiver with dummy data - we'll update it each frame
+    quiv = ax.quiver([0], [0], [1], [0], angles='xy', scale_units='xy', scale=1, color='tab:purple', width=0.006)
+    # Circle around robot (10cm radius, relatively transparent)
+    robot_circle = patches.Circle((0, 0), 0.1, color='tab:purple', alpha=0.3, fill=True, zorder=3)
+    ax.add_patch(robot_circle)
+
+    # text for cmd values
+    cmd_text = ax.text(0.02, 0.98, '', transform=ax.transAxes, verticalalignment='top',
+                    fontfamily='monospace', fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    ax.legend()
+
+    # trajectory history data storage (similar to plot_localization_xy.py)
+    x_history = deque(maxlen=10000)
+    y_history = deque(maxlen=10000)
+    time_history = deque(maxlen=10000)  # Store timestamps for each point
+
+    start_time = time.time()
+    last_timestamp_time = start_time  # Track when last timestamp was added
+    timestamp_annotations = []  # Store timestamp text annotations
+
+    # autoscale to include waypoints and robot
+    margin = 1.0
+    if waypoints:
+        min_x, max_x = min(wp_x), max(wp_x)
+        min_y, max_y = min(wp_y), max(wp_y)
+        ax.set_xlim(min_x - margin, max_x + margin)
+        ax.set_ylim(min_y - margin, max_y + margin)
+    else:
+        ax.set_xlim(-5, 5)
+        ax.set_ylim(-5, 5)
+
+    def update(frame):
+        nonlocal last_timestamp_time, timestamp_annotations
+        now = time.time()
+        t = now - start_time
+
+        with node.lock:
+            got_pose = node.latest_pose['got']
+            got_cmd = node.latest_cmd['got']
+            rx = node.latest_pose['x']
+            ry = node.latest_pose['y']
+            ryaw = node.latest_pose['yaw']
+            lx = node.latest_cmd['lin_x']
+            ly = node.latest_cmd['lin_y']
+            az = node.latest_cmd['ang_z']
+            
+            # get waypoint indices
+            lookahead_idx = node.lookahead_waypoint_idx['val'] if node.lookahead_waypoint_idx['got'] else -1
+            current_idx = node.current_waypoint_idx['val'] if node.current_waypoint_idx['got'] else -1
+
+            # determine derivative values
+            deriv_ang_value = None
+            deriv_lin_value = None
+            if node.derivative_source == 'publish':
+                if node.latest_deriv_ang['got']:
+                    deriv_ang_value = node.latest_deriv_ang['val']
+                if node.latest_deriv_lin['got']:
+                    deriv_lin_value = node.latest_deriv_lin['val']
+            else:
+                # estimate derivative from lin_x changes (linear only for estimation mode)
+                if node._prev_cmd_lin_x is None and node.latest_cmd_time is not None:
+                    # initialize previous values
+                    node._prev_cmd_lin_x = lx
+                    node._prev_cmd_time = node.latest_cmd_time
+                    deriv_lin_value = 0.0
+                elif node._prev_cmd_lin_x is not None and node.latest_cmd_time is not None:
+                    dt = node.latest_cmd_time - node._prev_cmd_time if node._prev_cmd_time is not None else None
+                    if dt and dt > 1e-6:
+                        deriv_lin_value = (lx - node._prev_cmd_lin_x) / dt
+                    else:
+                        deriv_lin_value = 0.0
+                    # update prev
+                    node._prev_cmd_lin_x = lx
+                    node._prev_cmd_time = node.latest_cmd_time
+            
+            # Update waypoint colors based on status
+            if len(wp_x) > 0:
+                wp_colors = []
+                for idx in range(len(wp_x)):
+                    if current_idx >= 0 and idx < current_idx:
+                        # Passed waypoints - grey
+                        wp_colors.append('grey')
+                    elif lookahead_idx >= 0 and idx == lookahead_idx:
+                        # Lookahead waypoint (next waypoint) - yellow
+                        wp_colors.append('yellow')
+                    else:
+                        # Future waypoints - blue
+                        wp_colors.append('tab:blue')
+                
+                # Update scatter plot colors (only if we have valid indices or want to reset to default)
+                if len(wp_colors) == len(wp_x):
+                    wp_scatter.set_facecolors(wp_colors)
+                    wp_scatter.set_edgecolors(wp_colors)
+
+        if got_pose:
+            # add to history (similar to plot_localization_xy.py)
+            x_history.append(rx)
+            y_history.append(ry)
+            time_history.append(t)
+
+            # update trajectory line
+            if len(x_history) > 1:
+                traj_line.set_data(list(x_history), list(y_history))
+
+            # Add timestamp annotation every 10 seconds
+            if now - last_timestamp_time >= 10.0:
+                # Format time as MM:SS or HH:MM:SS if longer
+                elapsed_seconds = int(t)
+                minutes = elapsed_seconds // 60
+                seconds = elapsed_seconds % 60
+                if minutes > 0:
+                    time_str = f"{minutes}:{seconds:02d}"
+                else:
+                    time_str = f"{seconds}s"
+                
+                # Add annotation at current robot position
+                annotation = ax.annotate(time_str, (rx, ry), 
+                                       fontsize=8, color='black',
+                                       bbox=dict(boxstyle='round,pad=0.3', 
+                                               facecolor='yellow', alpha=0.7),
+                                       ha='center', va='bottom')
+                timestamp_annotations.append(annotation)
+                last_timestamp_time = now
+
+            robot_point.set_data([rx], [ry])
+            # Update quiver in-place (much faster than recreating)
+            arrow_len = 0.5
+            ux = math.cos(ryaw) * arrow_len
+            uy = math.sin(ryaw) * arrow_len
+            quiv.set_offsets([[rx, ry]])
+            quiv.set_UVC(ux, uy)
+            # Update robot circle position
+            robot_circle.center = (rx, ry)
+
+            # auto-scale axes to fit trajectory with margin (similar to plot_localization_xy.py)
+            if len(x_history) > 0:
+                margin = 0.5
+                min_x, max_x = min(x_history), max(x_history)
+                min_y, max_y = min(y_history), max(y_history)
+                
+                # also consider waypoints in bounds
+                if waypoints:
+                    wp_min_x, wp_max_x = min(wp_x), max(wp_x)
+                    wp_min_y, wp_max_y = min(wp_y), max(wp_y)
+                    min_x = min(min_x, wp_min_x)
+                    max_x = max(max_x, wp_max_x)
+                    min_y = min(min_y, wp_min_y)
+                    max_y = max(max_y, wp_max_y)
+                
+                # add margin
+                x_range = max_x - min_x
+                y_range = max_y - min_y
+                
+                if x_range < 0.1:
+                    x_range = 10.0
+                if y_range < 0.1:
+                    y_range = 10.0
+                
+                ax.set_xlim(min_x - margin, max_x + margin)
+                ax.set_ylim(min_y - margin, max_y + margin)
+
+        # update cmd text
+        waypoint_info = ""
+        if current_idx >= 0 or lookahead_idx >= 0:
+            waypoint_info = f"\ncurrent wp={current_idx}, lookahead wp={lookahead_idx}"
+        txt = f"cmd lin_x={lx:.3f}, lin_y={ly:.3f}, ang_z={az:.3f}\npose got={got_pose}, cmd got={got_cmd}{waypoint_info}"
+        cmd_text.set_text(txt)
+
+        return line_wp, traj_line, robot_point, quiv, cmd_text, wp_scatter, robot_circle
+
+    ani = animation.FuncAnimation(fig, update, interval=1000.0/args.rate, blit=False, cache_frame_data=False)
+    
+    plt.tight_layout()
+    
+    try:
+        plt.show(block=True)
+    except KeyboardInterrupt:
+        pass
+
+    # cleanup
+    node.get_logger().info('Shutting down DebugVisualizer')
+    rclpy.shutdown()
+    spin_thread.join(timeout=1.0)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
