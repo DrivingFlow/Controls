@@ -5,11 +5,14 @@
 #include <sstream>
 #include <unistd.h>
 #include <cmath>
+#include <mutex>
 
 #include "rclcpp/rclcpp.hpp"
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/int32.hpp>
 
@@ -29,6 +32,8 @@ int state = -1;
 
 std::vector<float> waypoints_x;
 std::vector<float> waypoints_y;
+std::mutex waypoints_mutex;  // Protect waypoints from concurrent access
+bool waypoints_updated = false;  // Flag to indicate new waypoints received
 
 // ========== CONTROL CONSTANTS ==========
 // Timing constants
@@ -73,11 +78,9 @@ const float MAX_LATERAL_SPEED = 0.1f;  // m/s - max sideways velocity for direct
 const float PROXIMITY_DISTANCE = 1.0f;  // meters
 const float MIN_PROXIMITY_FACTOR = 0.3f;
 
-// Final waypoint thresholds
-const float FINAL_WAYPOINT_DISTANCE_THRESHOLD = 0.2f;  // meters
-const float FINAL_WAYPOINT_ANGLE_THRESHOLD = 0.2f;  // rad (~11 degrees)
-const float FINAL_WAYPOINT_VERY_CLOSE = 0.15f;  // meters
-const float FINAL_WAYPOINT_SLOW_DOWN = 0.5f;  // meters
+// Final waypoint thresholds (hysteresis: stop at STOP threshold, resume only beyond RESUME threshold)
+const float FINAL_WAYPOINT_STOP_DISTANCE = 0.5f;   // meters - enter idle when closer than this
+const float FINAL_WAYPOINT_RESUME_DISTANCE = 1.0f;  // meters - exit idle only when farther than this
 
 // Derivative term limits (for visualization/debugging)
 const float MAX_ANGULAR_DERIVATIVE = 3.0f;  // rad/s²
@@ -129,55 +132,27 @@ int main(int argc, char** argv)
     nh->get_parameter("max_angular_speed", max_angular_speed);
     nh->get_parameter("minTurnSpeedFactor", minTurnSpeedFactor);
 
-    // Load waypoints from CSV file
-    std::ifstream file("/home/dog22/calib_imu/src/mover/src/waypoints.csv");
-    std::string line;
-    
-    // Read header line and find x and y column indices
-    std::getline(file, line);
-    std::stringstream header_ss(line);
-    std::string col_name;
-    int x_col = -1, y_col = -1;
-    int col_idx = 0;
-    
-    while (std::getline(header_ss, col_name, ',')) {
-        // Trim whitespace from column name
-        col_name.erase(0, col_name.find_first_not_of(" \t\r\n"));
-        col_name.erase(col_name.find_last_not_of(" \t\r\n") + 1);
-        
-        RCLCPP_INFO(nh->get_logger(), "Column %d: '%s'", col_idx, col_name.c_str());
-        
-        if (col_name == "x") x_col = col_idx;
-        if (col_name == "y") y_col = col_idx;
-        col_idx++;
-    }
-    
-    RCLCPP_INFO(nh->get_logger(), "Found x at column %d, y at column %d", x_col, y_col);
-    
-    if (x_col == -1 || y_col == -1) {
-        RCLCPP_ERROR(nh->get_logger(), "Could not find 'x' and 'y' columns in CSV header");
-        return -1;
-    }
-    // Read waypoint data
-    while (std::getline(file, line)) {
-        std::stringstream ss(line);
-        std::string value;
-        std::vector<std::string> row_values;
-        
-        // Read all columns into a vector
-        while (std::getline(ss, value, ',')) {
-            row_values.push_back(value);
-        }
-        
-        // Extract x and y values from their respective columns
-        if (row_values.size() > x_col && row_values.size() > y_col) {
-            waypoints_x.push_back(std::stod(row_values[x_col]));
-            waypoints_y.push_back(std::stod(row_values[y_col]));
-        }
-    }
-    file.close();
-    
-    RCLCPP_INFO(nh->get_logger(), "Loaded %zu waypoints", waypoints_x.size());
+    // Subscribe to waypoints topic
+    auto sub_waypoints = nh->create_subscription<nav_msgs::msg::Path>(
+        "/waypoints", 10,
+        [&](const nav_msgs::msg::Path::SharedPtr msg) {
+            std::lock_guard<std::mutex> lock(waypoints_mutex);
+            
+            // Clear existing waypoints
+            waypoints_x.clear();
+            waypoints_y.clear();
+            
+            // Extract waypoints from Path message
+            for (const auto& pose_stamped : msg->poses) {
+                waypoints_x.push_back(pose_stamped.pose.position.x);
+                waypoints_y.push_back(pose_stamped.pose.position.y);
+            }
+            
+            // Set flag to reset waypoint index
+            waypoints_updated = true;
+            
+            RCLCPP_INFO(nh->get_logger(), "Received %zu new waypoints from /waypoints topic", waypoints_x.size());
+        });
 
     auto pubGo2Request = nh->create_publisher<unitree_api::msg::Request>("/api/sport/request", 10);
     auto pubSpeed = nh->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 5);
@@ -188,6 +163,8 @@ int main(int argc, char** argv)
     // Publishers for waypoint indices for visualization
     auto pubLookaheadWaypoint = nh->create_publisher<std_msgs::msg::Int32>("/waypoint/lookahead", 10);
     auto pubCurrentWaypoint = nh->create_publisher<std_msgs::msg::Int32>("/waypoint/current", 10);
+    // Publisher for controller status: true = reached final waypoint (idle), false = following path
+    auto pubReached = nh->create_publisher<std_msgs::msg::Bool>("/waypoint/reached", 10);
     
     auto sub_odom = nh->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "/pcl_pose", 10,
@@ -238,6 +215,9 @@ int main(int argc, char** argv)
     float prev_lookahead_dist = 0.0;
     const float MOVING_AWAY_THRESHOLD = 0.02f;  // 2cm tolerance before triggering
 
+    // Flag to track if we've reached the final waypoint (avoids log spam while idle)
+    bool reached_final = false;
+
     // Wait for first odometry message
     RCLCPP_INFO(nh->get_logger(), "Waiting for odometry data...");
     while (current_x == 0.0 && current_y == 0.0 && rclcpp::ok()) {
@@ -269,6 +249,21 @@ int main(int argc, char** argv)
     while (status){
         rclcpp::spin_some(nh);
         
+        // Check if waypoints were updated and reset index if needed
+        {
+            std::lock_guard<std::mutex> lock(waypoints_mutex);
+            if (waypoints_updated) {
+                i = 0;
+                pathPointID = 0;
+                vehicleSpeed = 0.0;
+                // NOTE: do NOT reset reached_final here — the hysteresis check
+                // in the control loop will clear it only if the new final waypoint
+                // is beyond FINAL_WAYPOINT_RESUME_DISTANCE (1.0m)
+                waypoints_updated = false;
+                RCLCPP_INFO(nh->get_logger(), "Waypoints updated! Reset to start. Total waypoints: %zu", waypoints_x.size());
+            }
+        }
+        
         auto current = std::chrono::system_clock::now();
         auto seconds = std::chrono::duration_cast<std::chrono::seconds>(current - beginning).count();
 
@@ -295,7 +290,10 @@ int main(int argc, char** argv)
             state = 1;
         }
         if(state == 1){
-        if (i < waypoints_x.size()){
+        // Lock waypoints for the duration of this control iteration
+        std::lock_guard<std::mutex> lock(waypoints_mutex);
+        
+        if (i < (int)waypoints_x.size()){
             // Find lookahead point: farthest waypoint within lookahead distance
             // CRITICAL: Don't advance lookahead if robot is far from current waypoint
             // This prevents aiming at points behind/beside the robot during turns
@@ -334,7 +332,6 @@ int main(int argc, char** argv)
             // 2. Lookahead point is significantly ahead (we've likely passed the waypoint)
             float dist_i_dx = waypoints_x[i] - current_x;
             float dist_i_dy = waypoints_y[i] - current_y;
-            float distance_i = std::sqrt(dist_i_dx * dist_i_dx + dist_i_dy * dist_i_dy);
 
             bool should_advance = false;
             
@@ -547,30 +544,27 @@ int main(int argc, char** argv)
             }
             prev_lookahead_dist = lookahead_dist;
             
-            // Check if we're at the final waypoint
-            bool is_final_waypoint = (i >= (int)waypoints_x.size() - 1);
-            float final_waypoint_dist = 0.0;
+            // ALWAYS check distance to the LAST waypoint, regardless of current index
+            float final_dx = waypoints_x[waypoints_x.size() - 1] - current_x;
+            float final_dy = waypoints_y[waypoints_y.size() - 1] - current_y;
+            float final_waypoint_dist = std::sqrt(final_dx * final_dx + final_dy * final_dy);
             bool should_stop_completely = false;
             
-            if (is_final_waypoint) {
-                float final_dx = waypoints_x[waypoints_x.size() - 1] - current_x;
-                float final_dy = waypoints_y[waypoints_y.size() - 1] - current_y;
-                final_waypoint_dist = std::sqrt(final_dx * final_dx + final_dy * final_dy);
-                
-                // Stop completely when close enough to final waypoint AND angular error is small
-                // This prevents oscillation around the final waypoint
-                float abs_ang_error_final = std::abs(dirDiff);
-                if (final_waypoint_dist < FINAL_WAYPOINT_DISTANCE_THRESHOLD && abs_ang_error_final < FINAL_WAYPOINT_ANGLE_THRESHOLD) {
+            // Hysteresis: once idle, only resume if final waypoint is beyond RESUME distance
+            if (reached_final) {
+                // Already idle — stay idle unless final waypoint is far enough away
+                if (final_waypoint_dist < FINAL_WAYPOINT_RESUME_DISTANCE) {
                     should_stop_completely = true;
                     targetSpeed = 0.0;
-                } else if (final_waypoint_dist < FINAL_WAYPOINT_VERY_CLOSE) {
-                    // Very close - stop forward motion but allow small rotation if needed
-                    targetSpeed = 0.0;
-                } else if (final_waypoint_dist < FINAL_WAYPOINT_SLOW_DOWN) {
-                    targetSpeed = max_linear_speed * (final_waypoint_dist / FINAL_WAYPOINT_SLOW_DOWN) * speed_reduction_factor;
                 } else {
+                    // New waypoints are far enough — exit idle
+                    reached_final = false;
                     targetSpeed = max_linear_speed * speed_reduction_factor;
                 }
+            } else if (final_waypoint_dist < FINAL_WAYPOINT_STOP_DISTANCE) {
+                // Not idle yet, but close enough to final destination → enter idle
+                should_stop_completely = true;
+                targetSpeed = 0.0;
             } else {
                 targetSpeed = max_linear_speed * speed_reduction_factor;
             }
@@ -578,7 +572,7 @@ int main(int argc, char** argv)
             // Ramp vehicleSpeed toward targetSpeed with acceleration limit
             // EXCEPTION: If we need to STOP due to overshoot or final waypoint, stop immediately
             float dt = CONTROL_LOOP_DT;
-            if (moving_away || (is_final_waypoint && targetSpeed == 0.0f)) {
+            if (moving_away || should_stop_completely) {
                 // Immediate stop - bypass gradual deceleration to prevent overshoot or at final waypoint
                 vehicleSpeed = 0.0f;
             } else {
@@ -641,6 +635,7 @@ int main(int argc, char** argv)
                 cmd_vel.twist.linear.y = 0.0;
                 cmd_vel.twist.angular.z = 0.0;
                 vehicleSpeed = 0.0;  // Reset speed for next iteration
+                vehicleYawRate = 0.0;
             } else {
                 cmd_vel.twist.linear.x = vehicleSpeed;      // Forward velocity in vehicle frame
                 cmd_vel.twist.linear.y = lateral_velocity;  // Sideways correction toward path
@@ -686,82 +681,93 @@ int main(int argc, char** argv)
             pubCurrentWaypoint->publish(current_msg);
 
             pubSpeed->publish(cmd_vel);
-            sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
+            if (should_stop_completely) {
+                // Use StopMove to halt the locomotion gait entirely (no jitter)
+                // Move(0,0,0) keeps the gait controller active → causes weight-shifting jitter
+                sport_req.StopMove(req);
+            } else {
+                sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
+            }
             pubGo2Request->publish(req);
 
-            // If we've reached the final waypoint and stopped, exit the control loop
-            if (should_stop_completely) {
-                RCLCPP_INFO(nh->get_logger(), "Final waypoint reached! Distance: %.3f m, Angular error: %.3f rad. Stopping robot.", 
-                           final_waypoint_dist, std::abs(dirDiff));
+            // If we've reached the final waypoint, log once and stay idle
+            if (should_stop_completely && !reached_final) {
+                reached_final = true;
+                RCLCPP_INFO(nh->get_logger(), "Final waypoint reached! Distance: %.3f m. Robot idle, waiting for new waypoints.", 
+                           final_waypoint_dist);
                 std::cout << "=== FINAL WAYPOINT REACHED ===" << std::endl;
                 std::cout << "Final position: (" << current_x << ", " << current_y << ")" << std::endl;
                 std::cout << "Target position: (" << waypoints_x[waypoints_x.size() - 1] << ", " 
                           << waypoints_y[waypoints_y.size() - 1] << ")" << std::endl;
                 std::cout << "Distance to final waypoint: " << final_waypoint_dist << " m" << std::endl;
-                std::cout << "Robot stopped successfully." << std::endl;
-                
-                // Keep sending stop commands for a few seconds to ensure robot stops
-                for (int stop_count = 0; stop_count < FINAL_STOP_COMMAND_COUNT; stop_count++) {
-                    cmd_vel.twist.linear.x = 0.0;
-                    cmd_vel.twist.linear.y = 0.0;
-                    cmd_vel.twist.angular.z = 0.0;
-                    pubSpeed->publish(cmd_vel);
-                    sport_req.Move(req, 0, 0, 0);
-                    pubGo2Request->publish(req);
-                    rate.sleep();
-                    rclcpp::spin_some(nh);
-                }
-                
-                break;  // Exit the main control loop
+                std::cout << "Robot idle. Waiting for new waypoints on /waypoints..." << std::endl;
             }
 
             if(seconds % STATUS_UPDATE_INTERVAL == 0){
-                std::cout << "=== Status Update ===" << std::endl;
-                std::cout << "Localization rate: " << odom_rate << " Hz (received " << odom_count << " messages)" << std::endl;
-                std::cout << "Current waypoint index: " << i << " / " << waypoints_x.size() << std::endl;
-                std::cout << "Lookahead point index: " << pathPointID << std::endl;
-                std::cout << "Current pose: (" << current_x << ", " << current_y << "), yaw=" << current_yaw << std::endl;
-                std::cout << "Target waypoint: (" << waypoints_x[i] << ", " << waypoints_y[i] << ")" << std::endl;
-                std::cout << "Lookahead point: (" << tx << ", " << ty << "), distance=" << lookahead_dist << std::endl;
-                std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
-                std::cout << "Lateral error: " << lateral_error << " m (+ = left of path, - = right)" << std::endl;
-                std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
-                std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", linear.y=" << cmd_vel.twist.linear.y << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
-                std::cout << "Control mode: " << (vehicleSpeed < 0.01f || abs_ang_error_for_mode > 0.44f ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
-                std::cout << "Pure pursuit curvature: " << pure_pursuit_curvature << " m^-1" << std::endl;
-                if (moving_away) {
-                    std::cout << "*** OVERSHOOT DETECTED: Moving away from target! ***" << std::endl;
-                }
-                if (angular_overshoot) {
-                    std::cout << "*** ANGULAR OVERSHOOT: Error increasing, stopped turning! ***" << std::endl;
-                }
-                if (is_final_waypoint) {
+                if (reached_final) {
+                    // Minimal output when idle — just confirm we're stopped
+                    std::cout << "=== IDLE === Cmd: 0,0,0 | Pose: (" << current_x << ", " << current_y 
+                              << ") | Dist to final: " << final_waypoint_dist << " m | Waiting for new waypoints (resume > " 
+                              << FINAL_WAYPOINT_RESUME_DISTANCE << " m) ===" << std::endl;
+                } else {
+                    std::cout << "=== Status Update ===" << std::endl;
+                    std::cout << "Localization rate: " << odom_rate << " Hz (received " << odom_count << " messages)" << std::endl;
+                    std::cout << "Current waypoint index: " << i << " / " << waypoints_x.size() << std::endl;
+                    std::cout << "Lookahead point index: " << pathPointID << std::endl;
+                    std::cout << "Current pose: (" << current_x << ", " << current_y << "), yaw=" << current_yaw << std::endl;
+                    std::cout << "Target waypoint: (" << waypoints_x[i] << ", " << waypoints_y[i] << ")" << std::endl;
+                    std::cout << "Lookahead point: (" << tx << ", " << ty << "), distance=" << lookahead_dist << std::endl;
+                    std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
+                    std::cout << "Lateral error: " << lateral_error << " m (+ = left of path, - = right)" << std::endl;
+                    std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
+                    std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", linear.y=" << cmd_vel.twist.linear.y << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
+                    std::cout << "Control mode: " << (vehicleSpeed < 0.01f || abs_ang_error_for_mode > 0.44f ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
+                    std::cout << "Pure pursuit curvature: " << pure_pursuit_curvature << " m^-1" << std::endl;
+                    if (moving_away) {
+                        std::cout << "*** OVERSHOOT DETECTED: Moving away from target! ***" << std::endl;
+                    }
+                    if (angular_overshoot) {
+                        std::cout << "*** ANGULAR OVERSHOOT: Error increasing, stopped turning! ***" << std::endl;
+                    }
                     std::cout << "Final waypoint distance: " << final_waypoint_dist << " m" << std::endl;
                 }
             }
         } else {
-            // All waypoints reached - stop the robot
+            // All waypoints reached (or none loaded) - stay idle and wait
             cmd_vel.twist.linear.x = 0.0;
             cmd_vel.twist.linear.y = 0.0;
             cmd_vel.twist.angular.z = 0.0;
             pubSpeed->publish(cmd_vel);
-            sport_req.Move(req, 0, 0, 0);
+            sport_req.StopMove(req);
             pubGo2Request->publish(req);
             
-            // Publish final waypoint indices
-            std_msgs::msg::Int32 lookahead_msg;
-            lookahead_msg.data = (int)waypoints_x.size() - 1;
-            pubLookaheadWaypoint->publish(lookahead_msg);
+            if (!waypoints_x.empty()) {
+                std_msgs::msg::Int32 lookahead_msg;
+                lookahead_msg.data = (int)waypoints_x.size() - 1;
+                pubLookaheadWaypoint->publish(lookahead_msg);
+                
+                std_msgs::msg::Int32 current_msg;
+                current_msg.data = (int)waypoints_x.size() - 1;
+                pubCurrentWaypoint->publish(current_msg);
+            }
             
-            std_msgs::msg::Int32 current_msg;
-            current_msg.data = (int)waypoints_x.size() - 1;
-            pubCurrentWaypoint->publish(current_msg);
-            
-            std::cout << "All waypoints reached! Stopping robot." << std::endl;
-            break;
+            if (!reached_final) {
+                reached_final = true;
+                if (waypoints_x.empty()) {
+                    RCLCPP_INFO(nh->get_logger(), "No waypoints loaded. Waiting for waypoints on /waypoints...");
+                } else {
+                    RCLCPP_INFO(nh->get_logger(), "All waypoints reached! Waiting for new waypoints on /waypoints...");
+                }
+            }
         }
     }
         
+        // Publish controller status every iteration
+        // true = done (idle, waiting for new path), false = following waypoints
+        std_msgs::msg::Bool reached_msg;
+        reached_msg.data = reached_final;
+        pubReached->publish(reached_msg);
+
         status = rclcpp::ok();
         rate.sleep();
     }
