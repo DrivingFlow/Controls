@@ -19,6 +19,7 @@
 #include <std_msgs/msg/int32.hpp>
 
 #include "unitree_api/msg/request.hpp"
+#include "unitree_go/msg/wireless_controller.hpp"
 #include "common/ros2_sport_client.h"
 
 float current_x = 0.0f;
@@ -36,6 +37,12 @@ std::vector<float> waypoints_x;
 std::vector<float> waypoints_y;
 std::mutex waypoints_mutex;  // Protect waypoints from concurrent access
 bool waypoints_updated = false;  // Flag to indicate new waypoints received
+
+// Emergency stop from wireless controller
+std::mutex estop_mutex;  // Protect emergency stop flag
+bool emergency_stop_active = false;  // Emergency stop flag
+bool emergency_stop_latched = false;  // Stays true after estop until explicit resume
+bool prev_estop_pressed = false;  // For edge-triggered logging
 
 // ========== CONTROL CONSTANTS ==========
 // Timing constants
@@ -190,6 +197,9 @@ int main(int argc, char** argv)
     nh->declare_parameter<float>("pointAcheivedDist", 0.1f); // Distance threshold to consider waypoint reached
     nh->declare_parameter<float>("minTurnSpeedFactor", 0.12f); // Keep some forward motion during large heading errors
     nh->declare_parameter<std::string>("waypoints_file", "");  // Path to CSV file with waypoints (x,y format)
+    nh->declare_parameter<int>("estop_key_exact", 4097);  // Observed controller value in this setup
+    nh->declare_parameter<int>("estop_key_mask", 0);      // Optional bitmask mode; 0 disables mask check
+    nh->declare_parameter<int>("resume_key_exact", 16386); // Resume motion only when estop is released
 
     // Local variables to hold parameter values (defaults mirrored in declare_parameter)
     float lookAheadDis = 0.8f;
@@ -203,6 +213,9 @@ int main(int argc, char** argv)
     float max_angular_speed = 0.35f;
     float pointAcheivedDist = 0.1f; // Distance threshold to consider waypoint reached
     float minTurnSpeedFactor = 0.12f; // Fraction of max speed to keep while turning
+    int estop_key_exact = 4097;
+    int estop_key_mask = 0;
+    int resume_key_exact = 16386;
 
     // Read params into local variables (overrides defaults above if provided)
     nh->get_parameter("lookAheadDis", lookAheadDis);
@@ -215,6 +228,9 @@ int main(int argc, char** argv)
     nh->get_parameter("max_linear_speed", max_linear_speed);
     nh->get_parameter("max_angular_speed", max_angular_speed);
     nh->get_parameter("minTurnSpeedFactor", minTurnSpeedFactor);
+    nh->get_parameter("estop_key_exact", estop_key_exact);
+    nh->get_parameter("estop_key_mask", estop_key_mask);
+    nh->get_parameter("resume_key_exact", resume_key_exact);
     
     // Load waypoints from CSV file if provided
     std::string waypoints_file;
@@ -291,6 +307,76 @@ int main(int argc, char** argv)
             odom_count++;
         });
 
+    // Emergency stop callback shared by both possible topic names.
+    auto wireless_cb = [&](const unitree_go::msg::WirelessController::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(estop_mutex);
+
+        // Support either exact key matching or bitmask matching.
+        const uint16_t keys = msg->keys;
+        bool estop_pressed_exact = keys == static_cast<uint16_t>(estop_key_exact);
+        bool estop_pressed_mask = false;
+        if (estop_key_mask > 0) {
+            const uint16_t mask = static_cast<uint16_t>(estop_key_mask);
+            estop_pressed_mask = (keys & mask) == mask;
+        }
+        bool estop_pressed = estop_pressed_exact || estop_pressed_mask;
+        bool resume_pressed = keys == static_cast<uint16_t>(resume_key_exact);
+
+        // Debug: show exactly what this node receives from the wireless controller.
+        // Throttled to avoid spamming at high publish rates.
+        RCLCPP_INFO_THROTTLE(
+            nh->get_logger(), *nh->get_clock(), 500,
+            "Wireless rx: keys=%u (0x%04X) lx=%.3f ly=%.3f rx=%.3f ry=%.3f estop_pressed=%s estop_latched=%s resume_pressed=%s",
+            static_cast<unsigned int>(keys),
+            static_cast<unsigned int>(keys),
+            static_cast<double>(msg->lx),
+            static_cast<double>(msg->ly),
+            static_cast<double>(msg->rx),
+            static_cast<double>(msg->ry),
+            estop_pressed ? "true" : "false",
+            emergency_stop_latched ? "true" : "false",
+            resume_pressed ? "true" : "false");
+
+        if (estop_pressed) {
+            if (!emergency_stop_latched) {
+                emergency_stop_latched = true;
+                RCLCPP_WARN(nh->get_logger(),
+                            "EMERGENCY STOP ACTIVATED (latched)! keys=%u exact=%d mask=%d",
+                            static_cast<unsigned int>(keys), estop_key_exact, estop_key_mask);
+            }
+            emergency_stop_active = true;
+        } else {
+            // Estop button released, but remain stopped while latched.
+            if (prev_estop_pressed && emergency_stop_latched) {
+                RCLCPP_WARN(nh->get_logger(),
+                            "Emergency stop button released, but stop remains latched. Press resume key (%d) to continue.",
+                            resume_key_exact);
+            }
+
+            if (emergency_stop_latched && resume_pressed) {
+                emergency_stop_latched = false;
+                emergency_stop_active = false;
+                RCLCPP_INFO(nh->get_logger(),
+                            "Emergency stop latch cleared by resume key. keys=%u",
+                            static_cast<unsigned int>(keys));
+            } else {
+                emergency_stop_active = emergency_stop_latched;
+            }
+        }
+
+        prev_estop_pressed = estop_pressed;
+    };
+
+    // Subscribe to both naming variants used in different stacks.
+    auto sub_wireless = nh->create_subscription<unitree_go::msg::WirelessController>(
+        "/wirelesscontroller", 10, wireless_cb);
+    auto sub_wireless_alt = nh->create_subscription<unitree_go::msg::WirelessController>(
+        "/wireless_controller", 10, wireless_cb);
+
+    RCLCPP_INFO(nh->get_logger(),
+                "Wireless estop monitor active. Topics: /wirelesscontroller, /wireless_controller, estop_exact=%d, estop_mask=%d, resume_exact=%d",
+                estop_key_exact, estop_key_mask, resume_key_exact);
+
     geometry_msgs::msg::TwistStamped cmd_vel;
         cmd_vel.header.frame_id = "vehicle";
 
@@ -353,6 +439,41 @@ int main(int argc, char** argv)
     while (status){
         rclcpp::spin_some(nh);
         
+        // EMERGENCY STOP CHECK - MUST BE FIRST, OVERRIDES EVERYTHING
+        bool estop_active = false;
+        {
+            std::lock_guard<std::mutex> lock(estop_mutex);
+            estop_active = emergency_stop_active;
+        }
+        
+        // If emergency stop is active, skip all control logic and just stop
+        if (estop_active) {
+            cmd_vel.twist.linear.x = 0.0;
+            cmd_vel.twist.linear.y = 0.0;
+            cmd_vel.twist.angular.z = 0.0;
+            pubSpeed->publish(cmd_vel);
+            sport_req.StopMove(req);
+            pubGo2Request->publish(req);
+            
+            // Publish waypoint indices for visualization even during emergency stop
+            std_msgs::msg::Int32 lookahead_msg;
+            lookahead_msg.data = pathPointID;
+            pubLookaheadWaypoint->publish(lookahead_msg);
+            
+            std_msgs::msg::Int32 current_msg;
+            current_msg.data = i;
+            pubCurrentWaypoint->publish(current_msg);
+            
+            // Publish controller status
+            std_msgs::msg::Bool reached_msg;
+            reached_msg.data = reached_final;
+            pubReached->publish(reached_msg);
+            
+            status = rclcpp::ok();
+            rate.sleep();
+            continue;  // Skip all control logic, go to next iteration
+        }
+        
         // Check if waypoints were updated and reset index if needed
         {
             std::lock_guard<std::mutex> lock(waypoints_mutex);
@@ -377,7 +498,12 @@ int main(int argc, char** argv)
             cmd_vel.twist.angular.z = 0;
             pubSpeed->publish(cmd_vel);
 
-            sport_req.Move(req, 0, 0, 0);
+            // Emergency stop already checked at top of loop, but double-check here
+            if (estop_active) {
+                sport_req.StopMove(req);
+            } else {
+                sport_req.Move(req, 0, 0, 0);
+            }
             pubGo2Request->publish(req);
             
             // Publish waypoint indices even during initial wait
@@ -784,15 +910,24 @@ int main(int argc, char** argv)
             current_msg.data = i;
             pubCurrentWaypoint->publish(current_msg);
 
+            // Emergency stop already checked at top of loop, but ensure we don't publish Move commands
             pubSpeed->publish(cmd_vel);
-            if (should_stop_completely) {
+            
+            // EMERGENCY STOP OVERRIDE: If emergency stop is active, ONLY publish StopMove
+            // (This should never happen since we check at top of loop, but safety check)
+            if (estop_active) {
+                // Emergency stop active - stop all movement immediately
+                sport_req.StopMove(req);
+                pubGo2Request->publish(req);
+            } else if (should_stop_completely) {
                 // Use StopMove to halt the locomotion gait entirely (no jitter)
                 // Move(0,0,0) keeps the gait controller active → causes weight-shifting jitter
                 sport_req.StopMove(req);
+                pubGo2Request->publish(req);
             } else {
                 sport_req.Move(req, cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
+                pubGo2Request->publish(req);
             }
-            pubGo2Request->publish(req);
 
             // If we've reached the final waypoint, log once and stay idle
             if (should_stop_completely && !reached_final) {
@@ -808,7 +943,17 @@ int main(int argc, char** argv)
             }
 
             if(seconds % STATUS_UPDATE_INTERVAL == 0){
-                if (reached_final) {
+                // Check emergency stop status for logging
+                bool estop_active_log = false;
+                {
+                    std::lock_guard<std::mutex> lock(estop_mutex);
+                    estop_active_log = emergency_stop_active;
+                }
+                
+                if (estop_active_log) {
+                    std::cout << "*** EMERGENCY STOP ACTIVE (LATCHED) *** All movement stopped. Waiting for resume key "
+                              << resume_key_exact << " with estop released..." << std::endl;
+                } else if (reached_final) {
                     // Minimal output when idle — just confirm we're stopped
                     std::cout << "=== IDLE === Cmd: 0,0,0 | Pose: (" << current_x << ", " << current_y 
                               << ") | Dist to final: " << final_waypoint_dist << " m | Waiting for new waypoints (resume > " 
@@ -842,6 +987,9 @@ int main(int argc, char** argv)
             cmd_vel.twist.linear.y = 0.0;
             cmd_vel.twist.angular.z = 0.0;
             pubSpeed->publish(cmd_vel);
+            
+            // Emergency stop already checked at top of loop
+            // Always use StopMove when idle (or emergency stop)
             sport_req.StopMove(req);
             pubGo2Request->publish(req);
             
