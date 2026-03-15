@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <cmath>
 #include <mutex>
+#include <string>
+#include <algorithm>
 
 #include "rclcpp/rclcpp.hpp"
 #include <geometry_msgs/msg/twist_stamped.hpp>
@@ -86,7 +88,88 @@ const float FINAL_WAYPOINT_RESUME_DISTANCE = 1.0f;  // meters - exit idle only w
 const float MAX_ANGULAR_DERIVATIVE = 3.0f;  // rad/s²
 const float MAX_LINEAR_DERIVATIVE = 2.0f;  // m/s²
 
-
+// Function to load waypoints from CSV file
+// CSV format: x,y (one waypoint per line)
+// Optional header row will be automatically skipped
+bool loadWaypointsFromCSV(const std::string& filename, std::vector<float>& waypoints_x, std::vector<float>& waypoints_y) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open waypoints file: " << filename << std::endl;
+        return false;
+    }
+    
+    waypoints_x.clear();
+    waypoints_y.clear();
+    
+    std::string line;
+    int line_num = 0;
+    bool header_skipped = false;
+    
+    while (std::getline(file, line)) {
+        line_num++;
+        
+        // Trim whitespace
+        line.erase(0, line.find_first_not_of(" \t\r\n"));
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+        
+        // Skip empty lines
+        if (line.empty()) {
+            continue;
+        }
+        
+        // Try to parse as x,y
+        std::istringstream iss(line);
+        std::string x_str, y_str;
+        
+        if (std::getline(iss, x_str, ',')) {
+            // Trim x_str
+            x_str.erase(0, x_str.find_first_not_of(" \t"));
+            x_str.erase(x_str.find_last_not_of(" \t") + 1);
+            
+            if (std::getline(iss, y_str)) {
+                // Trim y_str
+                y_str.erase(0, y_str.find_first_not_of(" \t"));
+                y_str.erase(y_str.find_last_not_of(" \t") + 1);
+                
+                try {
+                    float x = std::stof(x_str);
+                    float y = std::stof(y_str);
+                    waypoints_x.push_back(x);
+                    waypoints_y.push_back(y);
+                    header_skipped = true;  // If we successfully parsed, header was already skipped or doesn't exist
+                } catch (const std::exception& e) {
+                    // If parsing fails on first line, assume it's a header and skip it
+                    if (!header_skipped && line_num == 1) {
+                        header_skipped = true;
+                        continue;
+                    } else {
+                        std::cerr << "Warning: Could not parse line " << line_num << ": " << line << std::endl;
+                        continue;
+                    }
+                }
+            } else {
+                // Only one value on line - skip if it's the first line (likely header)
+                if (!header_skipped && line_num == 1) {
+                    header_skipped = true;
+                    continue;
+                } else {
+                    std::cerr << "Warning: Line " << line_num << " does not have y coordinate: " << line << std::endl;
+                    continue;
+                }
+            }
+        }
+    }
+    
+    file.close();
+    
+    if (waypoints_x.empty()) {
+        std::cerr << "Error: No valid waypoints found in file: " << filename << std::endl;
+        return false;
+    }
+    
+    std::cout << "Successfully loaded " << waypoints_x.size() << " waypoints from " << filename << std::endl;
+    return true;
+}
 
 
 int main(int argc, char** argv)
@@ -106,6 +189,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<float>("max_angular_speed", 0.35f);  // Reduced from 0.35 to prevent saturation
     nh->declare_parameter<float>("pointAcheivedDist", 0.1f); // Distance threshold to consider waypoint reached
     nh->declare_parameter<float>("minTurnSpeedFactor", 0.12f); // Keep some forward motion during large heading errors
+    nh->declare_parameter<std::string>("waypoints_file", "");  // Path to CSV file with waypoints (x,y format)
 
     // Local variables to hold parameter values (defaults mirrored in declare_parameter)
     float lookAheadDis = 0.8f;
@@ -131,28 +215,48 @@ int main(int argc, char** argv)
     nh->get_parameter("max_linear_speed", max_linear_speed);
     nh->get_parameter("max_angular_speed", max_angular_speed);
     nh->get_parameter("minTurnSpeedFactor", minTurnSpeedFactor);
+    
+    // Load waypoints from CSV file if provided
+    std::string waypoints_file;
+    nh->get_parameter("waypoints_file", waypoints_file);
+    bool use_csv_waypoints = false;
+    
+    if (!waypoints_file.empty()) {
+        std::lock_guard<std::mutex> lock(waypoints_mutex);
+        if (loadWaypointsFromCSV(waypoints_file, waypoints_x, waypoints_y)) {
+            use_csv_waypoints = true;
+            RCLCPP_INFO(nh->get_logger(), "Loaded %zu waypoints from CSV file: %s", waypoints_x.size(), waypoints_file.c_str());
+        } else {
+            RCLCPP_ERROR(nh->get_logger(), "Failed to load waypoints from CSV file: %s", waypoints_file.c_str());
+        }
+    }
 
-    // Subscribe to waypoints topic
-    auto sub_waypoints = nh->create_subscription<nav_msgs::msg::Path>(
-        "/waypoints", 10,
-        [&](const nav_msgs::msg::Path::SharedPtr msg) {
-            std::lock_guard<std::mutex> lock(waypoints_mutex);
-            
-            // Clear existing waypoints
-            waypoints_x.clear();
-            waypoints_y.clear();
-            
-            // Extract waypoints from Path message
-            for (const auto& pose_stamped : msg->poses) {
-                waypoints_x.push_back(pose_stamped.pose.position.x);
-                waypoints_y.push_back(pose_stamped.pose.position.y);
-            }
-            
-            // Set flag to reset waypoint index
-            waypoints_updated = true;
-            
-            RCLCPP_INFO(nh->get_logger(), "Received %zu new waypoints from /waypoints topic", waypoints_x.size());
-        });
+    // Subscribe to waypoints topic (only used if CSV file is not provided)
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_waypoints;
+    if (!use_csv_waypoints) {
+        sub_waypoints = nh->create_subscription<nav_msgs::msg::Path>(
+            "/waypoints", 10,
+            [&](const nav_msgs::msg::Path::SharedPtr msg) {
+                std::lock_guard<std::mutex> lock(waypoints_mutex);
+                
+                // Clear existing waypoints
+                waypoints_x.clear();
+                waypoints_y.clear();
+                
+                // Extract waypoints from Path message
+                for (const auto& pose_stamped : msg->poses) {
+                    waypoints_x.push_back(pose_stamped.pose.position.x);
+                    waypoints_y.push_back(pose_stamped.pose.position.y);
+                }
+                
+                // Set flag to reset waypoint index
+                waypoints_updated = true;
+                
+                RCLCPP_INFO(nh->get_logger(), "Received %zu new waypoints from /waypoints topic", waypoints_x.size());
+            });
+    } else {
+        RCLCPP_INFO(nh->get_logger(), "Using waypoints from CSV file. ROS topic subscription disabled.");
+    }
 
     auto pubGo2Request = nh->create_publisher<unitree_api::msg::Request>("/api/sport/request", 10);
     auto pubSpeed = nh->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 5);
