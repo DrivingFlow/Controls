@@ -33,16 +33,20 @@ find_package(go2_sport_api REQUIRED)
 add_executable(calibrate_imu src/calibrate_imu.cpp)
 add_executable(motion src/motion.cpp)
 add_executable(walk_straight src/walk_straight.cpp)
+add_executable(waypoint_sequencer src/waypoint_sequencer.cpp)
 ament_target_dependencies(calibrate_imu rclcpp std_msgs sensor_msgs geometry_msgs unitree_api go2_sport_api)
 
 ament_target_dependencies(motion rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs unitree_api go2_sport_api)
 
 ament_target_dependencies(walk_straight rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs unitree_api go2_sport_api)
 
+ament_target_dependencies(waypoint_sequencer rclcpp std_msgs geometry_msgs)
+
 install(TARGETS
   calibrate_imu
   motion
   walk_straight
+  waypoint_sequencer
   DESTINATION lib/${PROJECT_NAME})
 
 # install(DIRECTORY

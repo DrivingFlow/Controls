@@ -43,6 +43,8 @@ std::mutex estop_mutex;  // Protect emergency stop flag
 bool emergency_stop_active = false;  // Emergency stop flag
 bool emergency_stop_latched = false;  // Stays true after estop until explicit resume
 bool prev_estop_pressed = false;  // For edge-triggered logging
+int estop_stop_count = 0;  // Counter for stop messages during e-stop activation
+const int ESTOP_STOP_COUNT_MAX = 10;  // Number of stop messages to send before going silent
 
 // ========== CONTROL CONSTANTS ==========
 // Timing constants
@@ -197,7 +199,7 @@ int main(int argc, char** argv)
     nh->declare_parameter<float>("pointAcheivedDist", 0.1f); // Distance threshold to consider waypoint reached
     nh->declare_parameter<float>("minTurnSpeedFactor", 0.12f); // Keep some forward motion during large heading errors
     nh->declare_parameter<std::string>("waypoints_file", "");  // Path to CSV file with waypoints (x,y format)
-    nh->declare_parameter<int>("estop_key_exact", 4097);  // Observed controller value in this setup
+    nh->declare_parameter<int>("estop_key_exact", 4096);  // Observed controller value in this setup
     nh->declare_parameter<int>("estop_key_mask", 0);      // Optional bitmask mode; 0 disables mask check
     nh->declare_parameter<int>("resume_key_exact", 16386); // Resume motion only when estop is released
 
@@ -213,7 +215,7 @@ int main(int argc, char** argv)
     float max_angular_speed = 0.35f;
     float pointAcheivedDist = 0.1f; // Distance threshold to consider waypoint reached
     float minTurnSpeedFactor = 0.12f; // Fraction of max speed to keep while turning
-    int estop_key_exact = 4097;
+    int estop_key_exact = 4096;
     int estop_key_mask = 0;
     int resume_key_exact = 16386;
 
@@ -340,6 +342,7 @@ int main(int argc, char** argv)
         if (estop_pressed) {
             if (!emergency_stop_latched) {
                 emergency_stop_latched = true;
+                estop_stop_count = 0;  // Reset stop counter for new e-stop activation
                 RCLCPP_WARN(nh->get_logger(),
                             "EMERGENCY STOP ACTIVATED (latched)! keys=%u exact=%d mask=%d",
                             static_cast<unsigned int>(keys), estop_key_exact, estop_key_mask);
@@ -448,27 +451,38 @@ int main(int argc, char** argv)
         
         // If emergency stop is active, skip all control logic and just stop
         if (estop_active) {
-            cmd_vel.twist.linear.x = 0.0;
-            cmd_vel.twist.linear.y = 0.0;
-            cmd_vel.twist.angular.z = 0.0;
-            pubSpeed->publish(cmd_vel);
-            sport_req.StopMove(req);
-            pubGo2Request->publish(req);
-            
+            // Only publish stop commands for the first few iterations
+            // After that, stop publishing to allow manual control
+            if (estop_stop_count < ESTOP_STOP_COUNT_MAX) {
+                cmd_vel.twist.linear.x = 0.0;
+                cmd_vel.twist.linear.y = 0.0;
+                cmd_vel.twist.angular.z = 0.0;
+                pubSpeed->publish(cmd_vel);
+                sport_req.StopMove(req);
+                pubGo2Request->publish(req);
+                estop_stop_count++;
+
+                if (estop_stop_count >= ESTOP_STOP_COUNT_MAX) {
+                    RCLCPP_INFO(nh->get_logger(),
+                        "E-stop: Initial stop sequence complete. Robot can now be manually controlled. Press resume key to continue autonomous control.");
+                }
+            }
+            // else: don't publish anything, allowing manual control
+
             // Publish waypoint indices for visualization even during emergency stop
             std_msgs::msg::Int32 lookahead_msg;
             lookahead_msg.data = pathPointID;
             pubLookaheadWaypoint->publish(lookahead_msg);
-            
+
             std_msgs::msg::Int32 current_msg;
             current_msg.data = i;
             pubCurrentWaypoint->publish(current_msg);
-            
+
             // Publish controller status
             std_msgs::msg::Bool reached_msg;
             reached_msg.data = reached_final;
             pubReached->publish(reached_msg);
-            
+
             status = rclcpp::ok();
             rate.sleep();
             continue;  // Skip all control logic, go to next iteration

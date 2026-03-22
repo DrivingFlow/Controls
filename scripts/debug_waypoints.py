@@ -212,7 +212,7 @@ def main():
 
     # prepare matplotlib: single plot (derivative plot hidden)
     plt.ion()
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+    fig, ax = plt.subplots(1, 1, figsize=(20, 15))
     ax.set_title('Waypoints + Robot Pose')
     ax.set_xlabel('X (forward)')
     ax.set_ylabel('Y (left)')
@@ -223,7 +223,7 @@ def main():
     wp_x = [p[0] for p in waypoints]
     wp_y = [p[1] for p in waypoints]
     # Create scatter plot for waypoints so we can color them individually
-    wp_scatter = ax.scatter(wp_x, wp_y, c='tab:blue', s=100, marker='o', label='waypoints', zorder=5)
+    wp_scatter = ax.scatter(wp_x, wp_y, c='tab:blue', s=50, marker='o', label='waypoints', zorder=5)
     # Also draw lines between waypoints
     line_wp, = ax.plot(wp_x, wp_y, '-', color='tab:blue', alpha=0.3, linewidth=1, zorder=1)
 
@@ -231,7 +231,7 @@ def main():
     traj_line, = ax.plot([], [], '-', color='tab:orange', linewidth=2, label='Trajectory History')
 
     # robot marker and orientation arrow (using purple/cyan instead of red)
-    robot_point, = ax.plot([], [], 'o', color='tab:purple', markersize=10, label='robot')
+    robot_point, = ax.plot([], [], 'o', color='tab:purple', markersize=8, label='robot')
     # Initialize quiver with dummy data - we'll update it each frame
     quiv = ax.quiver([0], [0], [1], [0], angles='xy', scale_units='xy', scale=1, color='tab:purple', width=0.006)
     # Circle around robot (10cm radius, relatively transparent)
@@ -254,15 +254,15 @@ def main():
     timestamp_annotations = []  # Store timestamp text annotations
 
     # autoscale to include waypoints and robot
-    margin = 1.0
+    margin = 5.0
     if waypoints:
         min_x, max_x = min(wp_x), max(wp_x)
         min_y, max_y = min(wp_y), max(wp_y)
         ax.set_xlim(min_x - margin, max_x + margin)
         ax.set_ylim(min_y - margin, max_y + margin)
     else:
-        ax.set_xlim(-5, 5)
-        ax.set_ylim(-5, 5)
+        ax.set_xlim(-10, 10)
+        ax.set_ylim(-10, 10)
 
     def update(frame):
         nonlocal last_timestamp_time, timestamp_annotations
@@ -351,8 +351,8 @@ def main():
                 # Add annotation at current robot position
                 annotation = ax.annotate(time_str, (rx, ry), 
                                        fontsize=8, color='black',
-                                       bbox=dict(boxstyle='round,pad=0.3', 
-                                               facecolor='yellow', alpha=0.7),
+                                    #    bbox=dict(boxstyle='round,pad=0.3', 
+                                    #            facecolor='yellow', alpha=0.7),
                                        ha='center', va='bottom')
                 timestamp_annotations.append(annotation)
                 last_timestamp_time = now
@@ -369,7 +369,7 @@ def main():
 
             # auto-scale axes to fit trajectory with margin (similar to plot_localization_xy.py)
             if len(x_history) > 0:
-                margin = 0.5
+                margin = 3.0
                 min_x, max_x = min(x_history), max(x_history)
                 min_y, max_y = min(y_history), max(y_history)
                 
@@ -387,9 +387,9 @@ def main():
                 y_range = max_y - min_y
                 
                 if x_range < 0.1:
-                    x_range = 10.0
+                    x_range = 20.0
                 if y_range < 0.1:
-                    y_range = 10.0
+                    y_range = 20.0
                 
                 ax.set_xlim(min_x - margin, max_x + margin)
                 ax.set_ylim(min_y - margin, max_y + margin)
