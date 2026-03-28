@@ -253,7 +253,7 @@ int main(int argc, char** argv)
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_waypoints;
     if (!use_csv_waypoints) {
         sub_waypoints = nh->create_subscription<nav_msgs::msg::Path>(
-            "/waypoints", 10,
+            "/waypoints", rclcpp::QoS(10).best_effort(),
             [&](const nav_msgs::msg::Path::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(waypoints_mutex);
                 
