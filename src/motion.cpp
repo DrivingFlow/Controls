@@ -60,11 +60,11 @@ const float LOOKAHEAD_DISTANCE_MULTIPLIER = 1.5f;
 const float WAYPOINT_PROJECTION_THRESHOLD = 0.8f;  // 80% past waypoint
 const float MIN_PATH_LENGTH = 0.01f;  // meters, to avoid division by zero
 
-// Angular error thresholds
-const float ANGLE_45_DEG = M_PI / 3.0f;
-const float ANGLE_30_DEG = M_PI / 4.0f;
-const float ANGLE_15_DEG = M_PI / 6.0f;
-const float ANGLE_5_DEG = M_PI / 18.0f;
+// Angular error thresholds (speed reduction bands)
+const float ANGLE_45_DEG = M_PI / 4.0f;   // 45 degrees
+const float ANGLE_30_DEG = M_PI / 6.0f;   // 30 degrees
+const float ANGLE_15_DEG = M_PI / 12.0f;  // 15 degrees
+const float ANGLE_5_DEG  = M_PI / 36.0f;  // 5 degrees
 
 // Speed reduction factors
 const float SPEED_REDUCTION_45DEG = 0.05f;
@@ -194,11 +194,18 @@ int main(int argc, char** argv)
     nh->declare_parameter<float>("yawErrorDeadband", 0.05f);  // Ignore small errors (rad)
     nh->declare_parameter<float>("maxAngErrorForForward", 0.785f);  // Stop forward motion if error > 45 deg (rad)
     nh->declare_parameter<float>("maxAccel", 0.5f);
+    nh->declare_parameter<float>("maxDecel", 2.0f);           // Braking rate (m/s²), deliberately stronger than accel
     nh->declare_parameter<float>("max_linear_speed", 0.4f);
     nh->declare_parameter<float>("max_angular_speed", 0.35f);  // Reduced from 0.35 to prevent saturation
     nh->declare_parameter<float>("pointAcheivedDist", 0.1f); // Distance threshold to consider waypoint reached
     nh->declare_parameter<float>("minTurnSpeedFactor", 0.12f); // Keep some forward motion during large heading errors
     nh->declare_parameter<std::string>("waypoints_file", "");  // Path to CSV file with waypoints (x,y format)
+    nh->declare_parameter<float>("lookaheadTimeGain", 0.8f);     // Seconds of lookahead per m/s of speed
+    nh->declare_parameter<float>("maxLateralAccel", 0.5f);       // Max lateral accel for curvature speed limit (m/s²)
+    nh->declare_parameter<float>("curvatureLookaheadDist", 5.0f); // How far ahead to scan for path curvature (m)
+    nh->declare_parameter<float>("lateralIntegralGain", 0.20f);  // Ki for lateral cross-track error integral
+    nh->declare_parameter<float>("lateralIntegralMax", 3.0f);    // Anti-windup clamp for lateral integral (m·s)
+    nh->declare_parameter<std::string>("log_file", "");           // CSV log path (empty = disabled)
     nh->declare_parameter<int>("estop_key_exact", 4096);  // Observed controller value in this setup
     nh->declare_parameter<int>("estop_key_mask", 0);      // Optional bitmask mode; 0 disables mask check
     nh->declare_parameter<int>("resume_key_exact", 16386); // Resume motion only when estop is released
@@ -211,10 +218,16 @@ int main(int argc, char** argv)
     float yawErrorDeadband = 0.05f;
     float maxAngErrorForForward = 0.785f;  // ~45 degrees
     float maxAccel = 0.5f;
+    float maxDecel = 2.0f;
     float max_linear_speed = 0.4f;
     float max_angular_speed = 0.35f;
     float pointAcheivedDist = 0.1f; // Distance threshold to consider waypoint reached
     float minTurnSpeedFactor = 0.12f; // Fraction of max speed to keep while turning
+    float lookaheadTimeGain = 0.8f;
+    float maxLateralAccel = 0.5f;
+    float curvatureLookaheadDist = 5.0f;
+    float lateralIntegralGain = 0.12f;
+    float lateralIntegralMax = 3.0f;
     int estop_key_exact = 4096;
     int estop_key_mask = 0;
     int resume_key_exact = 16386;
@@ -227,9 +240,15 @@ int main(int argc, char** argv)
     nh->get_parameter("yawErrorDeadband", yawErrorDeadband);
     nh->get_parameter("maxAngErrorForForward", maxAngErrorForForward);
     nh->get_parameter("maxAccel", maxAccel);
+    nh->get_parameter("maxDecel", maxDecel);
     nh->get_parameter("max_linear_speed", max_linear_speed);
     nh->get_parameter("max_angular_speed", max_angular_speed);
     nh->get_parameter("minTurnSpeedFactor", minTurnSpeedFactor);
+    nh->get_parameter("lookaheadTimeGain", lookaheadTimeGain);
+    nh->get_parameter("maxLateralAccel", maxLateralAccel);
+    nh->get_parameter("curvatureLookaheadDist", curvatureLookaheadDist);
+    nh->get_parameter("lateralIntegralGain", lateralIntegralGain);
+    nh->get_parameter("lateralIntegralMax", lateralIntegralMax);
     nh->get_parameter("estop_key_exact", estop_key_exact);
     nh->get_parameter("estop_key_mask", estop_key_mask);
     nh->get_parameter("resume_key_exact", resume_key_exact);
@@ -246,6 +265,20 @@ int main(int argc, char** argv)
             RCLCPP_INFO(nh->get_logger(), "Loaded %zu waypoints from CSV file: %s", waypoints_x.size(), waypoints_file.c_str());
         } else {
             RCLCPP_ERROR(nh->get_logger(), "Failed to load waypoints from CSV file: %s", waypoints_file.c_str());
+        }
+    }
+
+    // CSV run logger for post-run diagnosis
+    std::string log_file;
+    nh->get_parameter("log_file", log_file);
+    std::ofstream log_stream;
+    if (!log_file.empty()) {
+        log_stream.open(log_file);
+        if (log_stream.is_open()) {
+            log_stream << "t,x,y,yaw,vehicleSpeed,targetSpeed,dirDiff,lateral_error,lateral_integral,lookahead_dist,effectiveLookahead,pathPointID,curvature,speed_factor,mode\n";
+            RCLCPP_INFO(nh->get_logger(), "Logging to CSV: %s", log_file.c_str());
+        } else {
+            RCLCPP_ERROR(nh->get_logger(), "Could not open log file: %s", log_file.c_str());
         }
     }
 
@@ -411,6 +444,9 @@ int main(int argc, char** argv)
     // Flag to track if we've reached the final waypoint (avoids log spam while idle)
     bool reached_final = false;
 
+    // Lateral error integral for persistent bias correction (e.g., rightward drift)
+    float lateral_error_integral = 0.0f;
+
     // Wait for first odometry message
     RCLCPP_INFO(nh->get_logger(), "Waiting for odometry data...");
     while (current_x == 0.0 && current_y == 0.0 && rclcpp::ok()) {
@@ -499,6 +535,7 @@ int main(int argc, char** argv)
                 // in the control loop will clear it only if the new final waypoint
                 // is beyond FINAL_WAYPOINT_RESUME_DISTANCE (1.0m)
                 waypoints_updated = false;
+                lateral_error_integral = 0.0f;
                 RCLCPP_INFO(nh->get_logger(), "Waypoints updated! Reset to start. Total waypoints: %zu", waypoints_x.size());
             }
         }
@@ -538,35 +575,32 @@ int main(int argc, char** argv)
         std::lock_guard<std::mutex> lock(waypoints_mutex);
         
         if (i < (int)waypoints_x.size()){
+            // Velocity-scaled lookahead: look further ahead when moving faster
+            float effectiveLookahead = lookAheadDis + vehicleSpeed * lookaheadTimeGain;
+
             // Find lookahead point: farthest waypoint within lookahead distance
-            // CRITICAL: Don't advance lookahead if robot is far from current waypoint
-            // This prevents aiming at points behind/beside the robot during turns
             float dist_to_current_wp_dx = waypoints_x[i] - current_x;
             float dist_to_current_wp_dy = waypoints_y[i] - current_y;
             float dist_to_current_wp = std::sqrt(dist_to_current_wp_dx * dist_to_current_wp_dx + 
                                                    dist_to_current_wp_dy * dist_to_current_wp_dy);
             
-            // Only advance lookahead if we're reasonably close to current waypoint
-            // This prevents lookahead from jumping ahead during wide turns
-            if (dist_to_current_wp < lookAheadDis * LOOKAHEAD_DISTANCE_MULTIPLIER) {
+            if (dist_to_current_wp < effectiveLookahead * LOOKAHEAD_DISTANCE_MULTIPLIER) {
                 pathPointID = std::max(pathPointID, i);
             } else {
-                // If far from current waypoint, don't advance lookahead beyond current waypoint
                 pathPointID = i;
             }
             
             int bestLookaheadID = pathPointID;
             
-            // Find the farthest waypoint that is still within lookahead distance
             for (int j = pathPointID; j < (int)waypoints_x.size(); j++) {
                 float pdx = waypoints_x[j] - current_x;
                 float pdy = waypoints_y[j] - current_y;
                 float pdist = std::sqrt(pdx * pdx + pdy * pdy);
                 
-                if (pdist <= lookAheadDis) {
-                    bestLookaheadID = j;  // This point is within lookahead distance
+                if (pdist <= effectiveLookahead) {
+                    bestLookaheadID = j;
                 } else {
-                    break;  // Beyond lookahead distance, stop searching
+                    break;
                 }
             }
             pathPointID = bestLookaheadID;
@@ -676,24 +710,30 @@ int main(int argc, char** argv)
                 // Could add sign based on robot orientation, but for final waypoint it's less critical
             }
 
-            // === LATERAL ERROR CORRECTION VIA HEADING ADJUSTMENT (Stanley-style) ===
-            // Instead of adding lateral correction to angular velocity (causes overshoot),
-            // we adjust the TARGET HEADING to include path convergence.
-            // This lets the PD controller handle smoothing naturally.
-            
-            // Calculate heading correction angle based on lateral error
-            // atan2(k * lateral_error, velocity) is the Stanley controller formula
-            // We use lookahead_dist as a proxy for "how far ahead we're looking"
+            // Accumulate lateral cross-track error integral (only on intermediate segments)
+            // Gentle decay when stopped (e-stop, TIP) so stale integral doesn't corrupt recovery
+            if (vehicleSpeed < 0.05f) {
+                lateral_error_integral *= 0.995f;
+            } else if (i < (int)waypoints_x.size() - 1) {
+                lateral_error_integral += lateral_error * CONTROL_LOOP_DT;
+                lateral_error_integral = std::max(-lateralIntegralMax, std::min(lateralIntegralMax, lateral_error_integral));
+            }
+
+            // === LATERAL ERROR CORRECTION VIA HEADING ADJUSTMENT (Stanley-style + Integral) ===
+            // Proportional: atan2(Kp * lateral_error, lookahead) adjusts heading toward path
+            // Integral: Ki * accumulated_lateral_error corrects persistent hardware bias
             float heading_correction = std::atan2(lateralErrorGain * lateral_error, 
                                                    std::max(lookahead_dist, MIN_LOOKAHEAD_FOR_LATERAL));
             
-            // Limit heading correction to prevent extreme adjustments (max ~8.5 degrees)
             const float MAX_HEADING_CORRECTION = 0.15f;  // radians (~8.5 degrees)
             heading_correction = std::max(-MAX_HEADING_CORRECTION, std::min(MAX_HEADING_CORRECTION, heading_correction));
             
-            // Adjust target heading: subtract correction because positive lateral_error (left of path)
-            // should result in turning right (reducing the target heading angle)
-            float adjusted_pathDir = pathDir - heading_correction;
+            float integral_heading_correction = lateralIntegralGain * lateral_error_integral;
+            const float MAX_INTEGRAL_CORRECTION = 0.15f;  // radians (~8.5 degrees)
+            integral_heading_correction = std::max(-MAX_INTEGRAL_CORRECTION, std::min(MAX_INTEGRAL_CORRECTION, integral_heading_correction));
+            
+            // Subtract corrections: positive lateral_error (left of path) → turn right
+            float adjusted_pathDir = pathDir - heading_correction - integral_heading_correction;
             
             // Angular error between ADJUSTED path direction and vehicle yaw
             float dirDiff = adjusted_pathDir - current_yaw;
@@ -737,13 +777,45 @@ int main(int argc, char** argv)
             // vehicleYawRate will be set after speed calculation (see below)
             float vehicleYawRate = 0.0f;
 
-            // Determine target forward speed based on:
-            // 1. Angular error (CRITICAL: stop or nearly stop when error is large)
-            // 2. Distance to lookahead point (slow down when close)
-            // 3. Angular velocity magnitude (prevent spinning while moving)
+            // === CURVATURE-BASED SPEED LIMITING ===
+            // Scan upcoming waypoints, compute max curvature, limit speed to v = sqrt(a_lat / k)
+            float max_upcoming_curvature = 0.0f;
+            {
+                float scan_dist = 0.0f;
+                for (int ci = std::max(i, 1); ci < (int)waypoints_x.size() - 1 && scan_dist < curvatureLookaheadDist; ci++) {
+                    float ax_c = waypoints_x[ci - 1], ay_c = waypoints_y[ci - 1];
+                    float bx_c = waypoints_x[ci],     by_c = waypoints_y[ci];
+                    float cx_c = waypoints_x[ci + 1], cy_c = waypoints_y[ci + 1];
+
+                    float ab = std::sqrt((bx_c - ax_c) * (bx_c - ax_c) + (by_c - ay_c) * (by_c - ay_c));
+                    float bc = std::sqrt((cx_c - bx_c) * (cx_c - bx_c) + (cy_c - by_c) * (cy_c - by_c));
+                    float ac = std::sqrt((cx_c - ax_c) * (cx_c - ax_c) + (cy_c - ay_c) * (cy_c - ay_c));
+
+                    // Menger curvature: k = 4 * area / (|AB| * |BC| * |AC|)
+                    float cross = std::abs((bx_c - ax_c) * (cy_c - ay_c) - (by_c - ay_c) * (cx_c - ax_c));
+                    float denom = ab * bc * ac;
+                    if (denom > 1e-6f) {
+                        float k = 2.0f * cross / denom;
+                        if (k > max_upcoming_curvature) max_upcoming_curvature = k;
+                    }
+                    scan_dist += bc;
+                }
+            }
+
+            float curvature_speed_limit = max_linear_speed;
+            if (max_upcoming_curvature > 1e-4f) {
+                curvature_speed_limit = std::sqrt(maxLateralAccel / max_upcoming_curvature);
+                curvature_speed_limit = std::max(curvature_speed_limit, max_linear_speed * 0.1f);
+            }
+
             float speed_reduction_factor = 1.0;
-            
-            // CRITICAL FIX: Stop forward motion when angular error is too large
+
+            // Apply curvature speed cap before other reductions
+            if (curvature_speed_limit < max_linear_speed) {
+                speed_reduction_factor = curvature_speed_limit / max_linear_speed;
+            }
+
+            // Stop forward motion when angular error is too large
             // This prevents wide arcs and dangerous overshoot
             float abs_ang_error = std::abs(dirDiff);
             if (abs_ang_error > maxAngErrorForForward) {
@@ -817,14 +889,17 @@ int main(int argc, char** argv)
             // EXCEPTION: If we need to STOP due to overshoot or final waypoint, stop immediately
             float dt = CONTROL_LOOP_DT;
             if (moving_away || should_stop_completely) {
-                // Immediate stop - bypass gradual deceleration to prevent overshoot or at final waypoint
                 vehicleSpeed = 0.0f;
+                if (moving_away) {
+                    lateral_error_integral *= 0.5f;
+                }
             } else {
-                float maxDelta = maxAccel * dt;
                 if (vehicleSpeed < targetSpeed) {
-                    vehicleSpeed = std::min(targetSpeed, vehicleSpeed + maxDelta);
+                    float maxUp = maxAccel * dt;
+                    vehicleSpeed = std::min(targetSpeed, vehicleSpeed + maxUp);
                 } else if (vehicleSpeed > targetSpeed) {
-                    vehicleSpeed = std::max(targetSpeed, vehicleSpeed - maxDelta);
+                    float maxDown = maxDecel * dt;
+                    vehicleSpeed = std::max(targetSpeed, vehicleSpeed - maxDown);
                 }
             }
             
@@ -886,8 +961,20 @@ int main(int argc, char** argv)
                 cmd_vel.twist.angular.z = vehicleYawRate;   // Face the path direction
             }
 
+            // CSV log row (every iteration, lightweight)
+            if (log_stream.is_open()) {
+                float t_sec = std::chrono::duration_cast<std::chrono::duration<float>>(
+                    std::chrono::system_clock::now() - beginning).count();
+                const char* mode = (vehicleSpeed < 0.01f || std::abs(dirDiff) > 0.44f) ? "TIP" : "PP";
+                log_stream << t_sec << ',' << current_x << ',' << current_y << ',' << current_yaw
+                           << ',' << vehicleSpeed << ',' << targetSpeed << ',' << dirDiff
+                           << ',' << lateral_error << ',' << lateral_error_integral
+                           << ',' << lookahead_dist << ',' << effectiveLookahead << ',' << pathPointID
+                           << ',' << max_upcoming_curvature << ',' << speed_reduction_factor
+                           << ',' << mode << '\n';
+            }
+
             // Publish derivatives for debugging/visualization
-            // Use the same timing as PD controller for consistency
             float dt_der = dt_ang;  // Use dt_ang calculated above for PD controller
             if (dt_der <= 1e-6f) dt_der = dt;
             
@@ -982,10 +1069,13 @@ int main(int argc, char** argv)
                     std::cout << "Lookahead point: (" << tx << ", " << ty << "), distance=" << lookahead_dist << std::endl;
                     std::cout << "Angular error: " << dirDiff << " rad (" << dirDiff * 180.0 / M_PI << " deg)" << std::endl;
                     std::cout << "Lateral error: " << lateral_error << " m (+ = left of path, - = right)" << std::endl;
+                    std::cout << "Lateral integral: " << lateral_error_integral << " m·s (correction: " << integral_heading_correction * 180.0 / M_PI << " deg)" << std::endl;
                     std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
                     std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", linear.y=" << cmd_vel.twist.linear.y << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
                     std::cout << "Control mode: " << (vehicleSpeed < 0.01f || abs_ang_error_for_mode > 0.44f ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
                     std::cout << "Pure pursuit curvature: " << pure_pursuit_curvature << " m^-1" << std::endl;
+                    std::cout << "Upcoming path curvature: " << max_upcoming_curvature << " m^-1 (speed limit: " << curvature_speed_limit << " m/s)" << std::endl;
+                    std::cout << "Effective lookahead: " << effectiveLookahead << " m (base: " << lookAheadDis << " + speed*" << lookaheadTimeGain << ")" << std::endl;
                     if (moving_away) {
                         std::cout << "*** OVERSHOOT DETECTED: Moving away from target! ***" << std::endl;
                     }

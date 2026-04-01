@@ -164,7 +164,7 @@ def start_rclpy_node(node):
 
 def main():
     parser = argparse.ArgumentParser(description='Debug waypoints visualizer')
-    parser.add_argument('--csv', '-c', default='/home/dog22/calib_imu/src/mover/src/waypoints.csv', help='Path to waypoints CSV')
+    parser.add_argument('--csv', '-c', default='/home/dog22/calib_imu/src/mover/src/waypoints_from_bag.csv', help='Path to waypoints CSV')
     parser.add_argument('--odom', default='/pcl_pose', help='Odometry topic (geometry_msgs/PoseWithCovarianceStamped)')
     parser.add_argument('--cmd', default='/cmd_vel', help='Motion command topic (geometry_msgs/TwistStamped)')
     parser.add_argument('--derivative-topic-angular', default='/pd_derivative/angular', help='Angular derivative topic (std_msgs/Float32)')
