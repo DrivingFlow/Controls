@@ -89,6 +89,12 @@ const float MAX_LATERAL_SPEED = 0.1f;  // m/s - max sideways velocity for direct
 const float PROXIMITY_DISTANCE = 1.0f;  // meters
 const float MIN_PROXIMITY_FACTOR = 0.3f;
 
+// Lateral-error-based speed control
+// Robot must slow down when far from the path to avoid hitting obstacles
+const float LATERAL_ERROR_SPEED_THRESHOLD = 0.5f;  // start reducing speed above this cross-track error (m)
+const float LATERAL_ERROR_SPEED_MAX = 2.0f;         // full reduction at this cross-track error (m)
+const float MIN_LATERAL_ERROR_SPEED_FACTOR = 0.15f;  // minimum speed factor when far off-path
+
 // Final waypoint thresholds (hysteresis: stop at STOP threshold, resume only beyond RESUME threshold)
 const float FINAL_WAYPOINT_STOP_DISTANCE = 0.5f;   // meters - enter idle when closer than this
 const float FINAL_WAYPOINT_RESUME_DISTANCE = 1.0f;  // meters - exit idle only when farther than this
@@ -439,10 +445,14 @@ int main(int argc, char** argv)
     
     // Overshoot detection: track if we're moving away from target
     float prev_lookahead_dist = 0.0;
-    const float MOVING_AWAY_THRESHOLD = 0.02f;  // 2cm tolerance before triggering
+    int prev_pathPointID = 0;
+    const float MOVING_AWAY_THRESHOLD = 0.10f;  // 10cm tolerance before triggering
 
     // Flag to track if we've reached the final waypoint (avoids log spam while idle)
     bool reached_final = false;
+
+    // Mode hysteresis: prevents chattering between PP and TIP
+    bool in_tip_mode = true;  // start in TIP until heading is aligned
 
     // Lateral error integral for persistent bias correction (e.g., rightward drift)
     float lateral_error_integral = 0.0f;
@@ -530,13 +540,27 @@ int main(int argc, char** argv)
             if (waypoints_updated) {
                 i = 0;
                 pathPointID = 0;
-                vehicleSpeed = 0.0;
-                // NOTE: do NOT reset reached_final here — the hysteresis check
-                // in the control loop will clear it only if the new final waypoint
-                // is beyond FINAL_WAYPOINT_RESUME_DISTANCE (1.0m)
                 waypoints_updated = false;
-                lateral_error_integral = 0.0f;
-                RCLCPP_INFO(nh->get_logger(), "Waypoints updated! Reset to start. Total waypoints: %zu", waypoints_x.size());
+
+                // Preserve speed if the new path direction is close to current heading.
+                // This avoids the stop-accelerate cycle on every path planner update.
+                if (waypoints_x.size() >= 2) {
+                    float new_dir = std::atan2(waypoints_y[1] - waypoints_y[0],
+                                               waypoints_x[1] - waypoints_x[0]);
+                    float dir_change = new_dir - current_yaw;
+                    while (dir_change > M_PI) dir_change -= 2.0 * M_PI;
+                    while (dir_change < -M_PI) dir_change += 2.0 * M_PI;
+                    if (std::abs(dir_change) > M_PI / 4.0f) {
+                        vehicleSpeed = 0.0;
+                        lateral_error_integral = 0.0f;
+                    }
+                    // else: keep current vehicleSpeed and integral
+                } else {
+                    vehicleSpeed = 0.0;
+                    lateral_error_integral = 0.0f;
+                }
+
+                RCLCPP_INFO(nh->get_logger(), "Waypoints updated! Total: %zu, speed=%.2f", waypoints_x.size(), vehicleSpeed);
             }
         }
         
@@ -578,32 +602,37 @@ int main(int argc, char** argv)
             // Velocity-scaled lookahead: look further ahead when moving faster
             float effectiveLookahead = lookAheadDis + vehicleSpeed * lookaheadTimeGain;
 
-            // Find lookahead point: farthest waypoint within lookahead distance
-            float dist_to_current_wp_dx = waypoints_x[i] - current_x;
-            float dist_to_current_wp_dy = waypoints_y[i] - current_y;
-            float dist_to_current_wp = std::sqrt(dist_to_current_wp_dx * dist_to_current_wp_dx + 
-                                                   dist_to_current_wp_dy * dist_to_current_wp_dy);
-            
-            if (dist_to_current_wp < effectiveLookahead * LOOKAHEAD_DISTANCE_MULTIPLIER) {
-                pathPointID = std::max(pathPointID, i);
-            } else {
-                pathPointID = i;
-            }
-            
-            int bestLookaheadID = pathPointID;
-            
-            for (int j = pathPointID; j < (int)waypoints_x.size(); j++) {
-                float pdx = waypoints_x[j] - current_x;
-                float pdy = waypoints_y[j] - current_y;
-                float pdist = std::sqrt(pdx * pdx + pdy * pdy);
-                
-                if (pdist <= effectiveLookahead) {
-                    bestLookaheadID = j;
+            // Lookahead: find the target waypoint ahead on the path.
+            // Uses path distance (not Euclidean) to prevent "seeing through" detours,
+            // but only when the robot is near the path. When far from the path,
+            // target the current waypoint to avoid runaway index advancement.
+            {
+                float dist_to_wp_i_dx = waypoints_x[i] - current_x;
+                float dist_to_wp_i_dy = waypoints_y[i] - current_y;
+                float dist_to_wp_i = std::sqrt(dist_to_wp_i_dx * dist_to_wp_i_dx + dist_to_wp_i_dy * dist_to_wp_i_dy);
+
+                if (dist_to_wp_i > effectiveLookahead * LOOKAHEAD_DISTANCE_MULTIPLIER) {
+                    // Robot is far from current waypoint -- just target it, don't look further
+                    pathPointID = i;
                 } else {
-                    break;
+                    // Robot is near the path -- use path-distance lookahead
+                    float path_dist = 0.0f;
+                    int bestLookaheadID = i;
+                    for (int j = i; j < (int)waypoints_x.size(); j++) {
+                        if (j > i) {
+                            float seg_dx = waypoints_x[j] - waypoints_x[j-1];
+                            float seg_dy = waypoints_y[j] - waypoints_y[j-1];
+                            path_dist += std::sqrt(seg_dx * seg_dx + seg_dy * seg_dy);
+                        }
+                        if (path_dist <= effectiveLookahead) {
+                            bestLookaheadID = j;
+                        } else {
+                            break;
+                        }
+                    }
+                    pathPointID = bestLookaheadID;
                 }
             }
-            pathPointID = bestLookaheadID;
 
             // Advance waypoint index `i` based on multiple criteria:
             // 1. Close enough to current waypoint (proximity-based)
@@ -668,46 +697,50 @@ int main(int argc, char** argv)
             float lookahead_dist = std::sqrt(dx * dx + dy * dy);
             float pathDir = std::atan2(dy, dx);
 
-            // Calculate lateral (cross-track) error to the current path segment
-            // This is critical for converging onto the path instead of tracking parallel to it
+            // Calculate lateral (cross-track) error to the NEAREST path segment
+            // in a local window around the current index.  Using only segment
+            // [i, i+1] causes sign-flip discontinuities when i advances on a
+            // curved path, producing the zigzag behaviour.
             float lateral_error = 0.0;
             if (i < (int)waypoints_x.size() - 1) {
-                // Vector from waypoint i to waypoint i+1 (path segment)
-                float seg_dx = waypoints_x[i+1] - waypoints_x[i];
-                float seg_dy = waypoints_y[i+1] - waypoints_y[i];
-                float seg_len = std::sqrt(seg_dx * seg_dx + seg_dy * seg_dy);
-                
-                if (seg_len > MIN_PATH_LENGTH) {  // Avoid division by zero
-                    // Vector from waypoint i to robot
-                    float robot_dx = current_x - waypoints_x[i];
-                    float robot_dy = current_y - waypoints_y[i];
-                    
-                    // Project robot position onto path segment
-                    float projection = (robot_dx * seg_dx + robot_dy * seg_dy) / (seg_len * seg_len);
-                    projection = std::max(0.0f, std::min(1.0f, projection));  // Clamp to [0, 1]
-                    
-                    // Closest point on path segment
-                    float closest_x = waypoints_x[i] + projection * seg_dx;
-                    float closest_y = waypoints_y[i] + projection * seg_dy;
-                    
-                    // Vector from closest point to robot (lateral error vector)
-                    float lateral_dx = current_x - closest_x;
-                    float lateral_dy = current_y - closest_y;
-                    
-                    // Calculate signed lateral error (positive = left of path, negative = right)
-                    // Use cross product to determine sign: seg × robot_vector
-                    float cross_product = seg_dx * lateral_dy - seg_dy * lateral_dx;
-                    lateral_error = std::sqrt(lateral_dx * lateral_dx + lateral_dy * lateral_dy);
-                    if (cross_product < 0) {
-                        lateral_error = -lateral_error;  // Robot is to the right of path
+                const int LATERAL_WINDOW = 3;  // check segments [i-W .. i+W]
+                int seg_lo = std::max(0, i - LATERAL_WINDOW);
+                int seg_hi = std::min((int)waypoints_x.size() - 2, i + LATERAL_WINDOW);
+
+                float best_dist_sq = 1e9f;
+                float best_lateral_error = 0.0f;
+
+                for (int si = seg_lo; si <= seg_hi; si++) {
+                    float s_dx = waypoints_x[si+1] - waypoints_x[si];
+                    float s_dy = waypoints_y[si+1] - waypoints_y[si];
+                    float s_len_sq = s_dx * s_dx + s_dy * s_dy;
+                    if (s_len_sq < MIN_PATH_LENGTH * MIN_PATH_LENGTH) continue;
+
+                    float r_dx = current_x - waypoints_x[si];
+                    float r_dy = current_y - waypoints_y[si];
+
+                    float proj = (r_dx * s_dx + r_dy * s_dy) / s_len_sq;
+                    proj = std::max(0.0f, std::min(1.0f, proj));
+
+                    float cx = waypoints_x[si] + proj * s_dx;
+                    float cy = waypoints_y[si] + proj * s_dy;
+
+                    float ldx = current_x - cx;
+                    float ldy = current_y - cy;
+                    float d_sq = ldx * ldx + ldy * ldy;
+
+                    if (d_sq < best_dist_sq) {
+                        best_dist_sq = d_sq;
+                        float dist = std::sqrt(d_sq);
+                        float cross = s_dx * ldy - s_dy * ldx;
+                        best_lateral_error = (cross < 0) ? -dist : dist;
                     }
                 }
+                lateral_error = best_lateral_error;
             } else {
-                // At final waypoint, use distance to final waypoint as lateral error
                 float final_dx = waypoints_x[i] - current_x;
                 float final_dy = waypoints_y[i] - current_y;
                 lateral_error = std::sqrt(final_dx * final_dx + final_dy * final_dy);
-                // Could add sign based on robot orientation, but for final waypoint it's less critical
             }
 
             // Accumulate lateral cross-track error integral (only on intermediate segments)
@@ -725,11 +758,11 @@ int main(int argc, char** argv)
             float heading_correction = std::atan2(lateralErrorGain * lateral_error, 
                                                    std::max(lookahead_dist, MIN_LOOKAHEAD_FOR_LATERAL));
             
-            const float MAX_HEADING_CORRECTION = 0.15f;  // radians (~8.5 degrees)
+            const float MAX_HEADING_CORRECTION = 0.35f;  // radians (~20 degrees)
             heading_correction = std::max(-MAX_HEADING_CORRECTION, std::min(MAX_HEADING_CORRECTION, heading_correction));
             
             float integral_heading_correction = lateralIntegralGain * lateral_error_integral;
-            const float MAX_INTEGRAL_CORRECTION = 0.15f;  // radians (~8.5 degrees)
+            const float MAX_INTEGRAL_CORRECTION = 0.25f;  // radians (~14 degrees)
             integral_heading_correction = std::max(-MAX_INTEGRAL_CORRECTION, std::min(MAX_INTEGRAL_CORRECTION, integral_heading_correction));
             
             // Subtract corrections: positive lateral_error (left of path) → turn right
@@ -779,26 +812,55 @@ int main(int argc, char** argv)
 
             // === CURVATURE-BASED SPEED LIMITING ===
             // Scan upcoming waypoints, compute max curvature, limit speed to v = sqrt(a_lat / k)
+            // Uses wide-baseline Menger curvature: for each point B, pick A and C at least
+            // MIN_CURVATURE_BASELINE apart to filter noise from closely-spaced waypoints.
             float max_upcoming_curvature = 0.0f;
             {
+                const float MIN_CURVATURE_BASELINE = 0.4f;
                 float scan_dist = 0.0f;
-                for (int ci = std::max(i, 1); ci < (int)waypoints_x.size() - 1 && scan_dist < curvatureLookaheadDist; ci++) {
-                    float ax_c = waypoints_x[ci - 1], ay_c = waypoints_y[ci - 1];
-                    float bx_c = waypoints_x[ci],     by_c = waypoints_y[ci];
-                    float cx_c = waypoints_x[ci + 1], cy_c = waypoints_y[ci + 1];
+                int n_wp = (int)waypoints_x.size();
+                for (int ci = std::max(i, 1); ci < n_wp - 1 && scan_dist < curvatureLookaheadDist; ci++) {
+                    // Find point A: walk backward from ci until >= MIN_CURVATURE_BASELINE
+                    int ai = ci - 1;
+                    float dist_back = 0.0f;
+                    while (ai > 0) {
+                        float dx_b = waypoints_x[ai] - waypoints_x[ai + 1];
+                        float dy_b = waypoints_y[ai] - waypoints_y[ai + 1];
+                        dist_back += std::sqrt(dx_b * dx_b + dy_b * dy_b);
+                        if (dist_back >= MIN_CURVATURE_BASELINE) break;
+                        ai--;
+                    }
+
+                    // Find point C: walk forward from ci until >= MIN_CURVATURE_BASELINE
+                    int cci = ci + 1;
+                    float dist_fwd = 0.0f;
+                    while (cci < n_wp - 1) {
+                        float dx_f = waypoints_x[cci] - waypoints_x[cci - 1];
+                        float dy_f = waypoints_y[cci] - waypoints_y[cci - 1];
+                        dist_fwd += std::sqrt(dx_f * dx_f + dy_f * dy_f);
+                        if (dist_fwd >= MIN_CURVATURE_BASELINE) break;
+                        cci++;
+                    }
+
+                    float ax_c = waypoints_x[ai], ay_c = waypoints_y[ai];
+                    float bx_c = waypoints_x[ci], by_c = waypoints_y[ci];
+                    float cx_c = waypoints_x[cci], cy_c = waypoints_y[cci];
 
                     float ab = std::sqrt((bx_c - ax_c) * (bx_c - ax_c) + (by_c - ay_c) * (by_c - ay_c));
                     float bc = std::sqrt((cx_c - bx_c) * (cx_c - bx_c) + (cy_c - by_c) * (cy_c - by_c));
                     float ac = std::sqrt((cx_c - ax_c) * (cx_c - ax_c) + (cy_c - ay_c) * (cy_c - ay_c));
 
-                    // Menger curvature: k = 4 * area / (|AB| * |BC| * |AC|)
                     float cross = std::abs((bx_c - ax_c) * (cy_c - ay_c) - (by_c - ay_c) * (cx_c - ax_c));
                     float denom = ab * bc * ac;
                     if (denom > 1e-6f) {
                         float k = 2.0f * cross / denom;
                         if (k > max_upcoming_curvature) max_upcoming_curvature = k;
                     }
-                    scan_dist += bc;
+
+                    // Advance scan distance using original consecutive spacing
+                    float seg_dx = waypoints_x[ci + 1] - waypoints_x[ci];
+                    float seg_dy = waypoints_y[ci + 1] - waypoints_y[ci];
+                    scan_dist += std::sqrt(seg_dx * seg_dx + seg_dy * seg_dy);
                 }
             }
 
@@ -840,7 +902,18 @@ int main(int argc, char** argv)
                 float proximity_factor = std::max(MIN_PROXIMITY_FACTOR, lookahead_dist / PROXIMITY_DISTANCE);
                 speed_reduction_factor *= proximity_factor;
             }
-            
+
+            // Reduce speed based on lateral (cross-track) error
+            // This is critical: without this, the robot can be meters off-path at full speed
+            float abs_lateral_error = std::abs(lateral_error);
+            if (abs_lateral_error > LATERAL_ERROR_SPEED_THRESHOLD) {
+                float lat_fraction = (abs_lateral_error - LATERAL_ERROR_SPEED_THRESHOLD)
+                                   / (LATERAL_ERROR_SPEED_MAX - LATERAL_ERROR_SPEED_THRESHOLD);
+                lat_fraction = std::min(lat_fraction, 1.0f);
+                float lat_error_speed_factor = 1.0f - lat_fraction * (1.0f - MIN_LATERAL_ERROR_SPEED_FACTOR);
+                speed_reduction_factor *= lat_error_speed_factor;
+            }
+
             // Also reduce speed based on angular velocity magnitude (prevent spinning while moving)
             float abs_yaw_rate = std::abs(vehicleYawRate);
             if (abs_yaw_rate > YAW_RATE_THRESHOLD) {
@@ -852,13 +925,17 @@ int main(int argc, char** argv)
             }
             
             // OVERSHOOT DETECTION: If distance to lookahead is INCREASING, we're moving away - STOP!
-            // This catches overshoots faster than heading error alone
+            // Only trigger when the lookahead target hasn't changed — a waypoint index
+            // jump naturally increases the distance and is not a real overshoot.
             bool moving_away = false;
-            if (prev_lookahead_dist > 0.0f && lookahead_dist > prev_lookahead_dist + MOVING_AWAY_THRESHOLD) {
+            if (prev_lookahead_dist > 0.0f
+                && pathPointID == prev_pathPointID
+                && lookahead_dist > prev_lookahead_dist + MOVING_AWAY_THRESHOLD) {
                 moving_away = true;
-                speed_reduction_factor = 0.0f;  // Stop forward motion immediately
+                speed_reduction_factor = 0.0f;
             }
             prev_lookahead_dist = lookahead_dist;
+            prev_pathPointID = pathPointID;
             
             // ALWAYS check distance to the LAST waypoint, regardless of current index
             float final_dx = waypoints_x[waypoints_x.size() - 1] - current_x;
@@ -904,22 +981,27 @@ int main(int argc, char** argv)
             }
             
             // === HYBRID CONTROL: Choose between Turn-in-Place and Pure Pursuit ===
-            // Threshold for switching between modes (~25 degrees)
-            const float PURE_PURSUIT_THRESHOLD = 0.44f;  // radians (~25 degrees)
+            // Hysteresis band prevents rapid mode switching (chattering)
+            const float TIP_ENTER_THRESHOLD = 0.52f;  // radians (~30 deg) — enter TIP above this
+            const float TIP_EXIT_THRESHOLD  = 0.26f;  // radians (~15 deg) — exit TIP below this
             
             float abs_ang_error_for_mode = std::abs(dirDiff);
             
-            if (vehicleSpeed < 0.01f || abs_ang_error_for_mode > PURE_PURSUIT_THRESHOLD) {
-                // TURN IN PLACE MODE: Large angular error or stopped
-                // Use P controller to turn toward target
+            if (in_tip_mode) {
+                if (vehicleSpeed >= 0.01f && abs_ang_error_for_mode < TIP_EXIT_THRESHOLD) {
+                    in_tip_mode = false;
+                }
+            } else {
+                if (vehicleSpeed < 0.01f || abs_ang_error_for_mode > TIP_ENTER_THRESHOLD) {
+                    in_tip_mode = true;
+                }
+            }
+            
+            if (in_tip_mode) {
                 vehicleYawRate = turnInPlaceYawRate;
             } else {
-                // PURE PURSUIT MODE: Small angular error and moving forward
-                // Use curvature-based control: angular velocity = linear velocity × curvature
-                // This creates smooth arcs instead of zig-zags!
                 vehicleYawRate = vehicleSpeed * pure_pursuit_curvature;
                 
-                // Still apply angular velocity limits
                 if (vehicleYawRate > max_angular_left) vehicleYawRate = max_angular_left;
                 if (vehicleYawRate < -max_angular_right) vehicleYawRate = -max_angular_right;
             }
@@ -965,7 +1047,7 @@ int main(int argc, char** argv)
             if (log_stream.is_open()) {
                 float t_sec = std::chrono::duration_cast<std::chrono::duration<float>>(
                     std::chrono::system_clock::now() - beginning).count();
-                const char* mode = (vehicleSpeed < 0.01f || std::abs(dirDiff) > 0.44f) ? "TIP" : "PP";
+                const char* mode = in_tip_mode ? "TIP" : "PP";
                 log_stream << t_sec << ',' << current_x << ',' << current_y << ',' << current_yaw
                            << ',' << vehicleSpeed << ',' << targetSpeed << ',' << dirDiff
                            << ',' << lateral_error << ',' << lateral_error_integral
@@ -1072,7 +1154,7 @@ int main(int argc, char** argv)
                     std::cout << "Lateral integral: " << lateral_error_integral << " m·s (correction: " << integral_heading_correction * 180.0 / M_PI << " deg)" << std::endl;
                     std::cout << "Heading correction: " << lateral_correction << " rad (" << lateral_correction * 180.0 / M_PI << " deg)" << std::endl;
                     std::cout << "Cmd: linear.x=" << cmd_vel.twist.linear.x << ", linear.y=" << cmd_vel.twist.linear.y << ", angular.z=" << cmd_vel.twist.angular.z << std::endl;
-                    std::cout << "Control mode: " << (vehicleSpeed < 0.01f || abs_ang_error_for_mode > 0.44f ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
+                    std::cout << "Control mode: " << (in_tip_mode ? "TURN-IN-PLACE" : "PURE PURSUIT") << std::endl;
                     std::cout << "Pure pursuit curvature: " << pure_pursuit_curvature << " m^-1" << std::endl;
                     std::cout << "Upcoming path curvature: " << max_upcoming_curvature << " m^-1 (speed limit: " << curvature_speed_limit << " m/s)" << std::endl;
                     std::cout << "Effective lookahead: " << effectiveLookahead << " m (base: " << lookAheadDis << " + speed*" << lookaheadTimeGain << ")" << std::endl;
