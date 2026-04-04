@@ -66,11 +66,11 @@ const float ANGLE_30_DEG = M_PI / 6.0f;   // 30 degrees
 const float ANGLE_15_DEG = M_PI / 12.0f;  // 15 degrees
 const float ANGLE_5_DEG  = M_PI / 36.0f;  // 5 degrees
 
-// Speed reduction factors
-const float SPEED_REDUCTION_45DEG = 0.05f;
-const float SPEED_REDUCTION_30DEG = 0.15f;
-const float SPEED_REDUCTION_15DEG = 0.4f;
-const float SPEED_REDUCTION_5DEG = 0.7f;
+// Speed reduction factors (moderate — slightly relaxed from original conservative values)
+const float SPEED_REDUCTION_45DEG = 0.10f;
+const float SPEED_REDUCTION_30DEG = 0.25f;
+const float SPEED_REDUCTION_15DEG = 0.50f;
+const float SPEED_REDUCTION_5DEG = 0.80f;
 const float ANGULAR_SPEED_SCALING = 0.9f;  // For medium angular errors
 
 // Angular velocity control
@@ -83,21 +83,21 @@ const float YAW_RATE_REDUCTION = 0.7f;
 const float MIN_LOOKAHEAD_FOR_LATERAL = 0.5f;  // meters
 const float MAX_LATERAL_CORRECTION = 0.3f;  // rad/s
 const float MIN_LATERAL_CORRECTION = -0.3f;  // rad/s
-const float MAX_LATERAL_SPEED = 0.1f;  // m/s - max sideways velocity for direct lateral correction
+const float MAX_LATERAL_SPEED = 0.2f;  // m/s - max sideways velocity for direct lateral correction
 
 // Proximity-based speed control
 const float PROXIMITY_DISTANCE = 1.0f;  // meters
 const float MIN_PROXIMITY_FACTOR = 0.3f;
 
 // Lateral-error-based speed control
-// Robot must slow down when far from the path to avoid hitting obstacles
-const float LATERAL_ERROR_SPEED_THRESHOLD = 0.5f;  // start reducing speed above this cross-track error (m)
-const float LATERAL_ERROR_SPEED_MAX = 2.0f;         // full reduction at this cross-track error (m)
-const float MIN_LATERAL_ERROR_SPEED_FACTOR = 0.15f;  // minimum speed factor when far off-path
+// Primary safety net: robot must slow down when far from the path
+const float LATERAL_ERROR_SPEED_THRESHOLD = 0.3f;  // start reducing speed above this cross-track error (m)
+const float LATERAL_ERROR_SPEED_MAX = 1.2f;         // full reduction at this cross-track error (m)
+const float MIN_LATERAL_ERROR_SPEED_FACTOR = 0.12f;  // minimum speed factor when far off-path
 
 // Final waypoint thresholds (hysteresis: stop at STOP threshold, resume only beyond RESUME threshold)
-const float FINAL_WAYPOINT_STOP_DISTANCE = 0.5f;   // meters - enter idle when closer than this
-const float FINAL_WAYPOINT_RESUME_DISTANCE = 1.0f;  // meters - exit idle only when farther than this
+const float FINAL_WAYPOINT_STOP_DISTANCE = 1.0f;   // meters - enter idle when closer than this
+const float FINAL_WAYPOINT_RESUME_DISTANCE = 1.5f;  // meters - exit idle only when farther than this
 
 // Derivative term limits (for visualization/debugging)
 const float MAX_ANGULAR_DERIVATIVE = 3.0f;  // rad/s²
@@ -942,20 +942,17 @@ int main(int argc, char** argv)
             float final_dy = waypoints_y[waypoints_y.size() - 1] - current_y;
             float final_waypoint_dist = std::sqrt(final_dx * final_dx + final_dy * final_dy);
             bool should_stop_completely = false;
-            
+
             // Hysteresis: once idle, only resume if final waypoint is beyond RESUME distance
             if (reached_final) {
-                // Already idle — stay idle unless final waypoint is far enough away
                 if (final_waypoint_dist < FINAL_WAYPOINT_RESUME_DISTANCE) {
                     should_stop_completely = true;
                     targetSpeed = 0.0;
                 } else {
-                    // New waypoints are far enough — exit idle
                     reached_final = false;
                     targetSpeed = max_linear_speed * speed_reduction_factor;
                 }
             } else if (final_waypoint_dist < FINAL_WAYPOINT_STOP_DISTANCE) {
-                // Not idle yet, but close enough to final destination → enter idle
                 should_stop_completely = true;
                 targetSpeed = 0.0;
             } else {
@@ -982,7 +979,7 @@ int main(int argc, char** argv)
             
             // === HYBRID CONTROL: Choose between Turn-in-Place and Pure Pursuit ===
             // Hysteresis band prevents rapid mode switching (chattering)
-            const float TIP_ENTER_THRESHOLD = 0.52f;  // radians (~30 deg) — enter TIP above this
+            const float TIP_ENTER_THRESHOLD = 0.70f;  // radians (~40 deg) — enter TIP above this
             const float TIP_EXIT_THRESHOLD  = 0.26f;  // radians (~15 deg) — exit TIP below this
             
             float abs_ang_error_for_mode = std::abs(dirDiff);
